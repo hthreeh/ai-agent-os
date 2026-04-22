@@ -1,0 +1,6 @@
+Model: MiniMax-M2.7
+Base URL: https://api.minimaxi.com/v1
+SUCCESS: <think>
+The user says: "Hello, reply
+</think>
+

@@ -1,0 +1,19 @@
+# Environment
+.env
+.env.example
+venv/
+.venv/
+
+# Logs
+*.log
+
+# Runtime
+*.pid
+*.db
+
+# Temp files
+tmp_*
+.backup/
+
+# OS
+.DS_Store
