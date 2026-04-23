@@ -31,6 +31,7 @@ from tools.security_tools import SecurityTools
 from tools.audit_logger import AuditLogger
 from tools.task_decomposer import LLMTaskDecomposer
 from tools.explainability import ExplainabilityEngine
+from tools.execution_verifier import ExecutionVerifier
 from src.state_manager import (
     AgentState,
     StateValidator,
@@ -228,6 +229,10 @@ GOAL_COMMAND_MAPPING = {
         "memory": "free -h",
         "disk": "df -h",
     },
+    # 配置修改（通用预览/定位命令，不直接写配置）
+    "modify_service_config": {
+        "port": "grep -rn 'listen' /etc/{service}/ 2>/dev/null | head -5 || echo 'Config preview not available'",
+    },
 }
 
 
@@ -297,6 +302,7 @@ def _validate_and_fix_state(state: Dict[str, Any]) -> Dict[str, Any]:
 def _is_confirmation_resume(state: Dict[str, Any]) -> bool:
     return (
         state.get("user_confirmation") is not None
+        and not state.get("confirmation_processed", False)
         and bool(state.get("task_sequence"))
         and bool(state.get("command"))
     )
@@ -361,7 +367,9 @@ def _extract_single_intent(text: str) -> Dict[str, Any]:
         return {"intent": "process_status", "parameters": {"sub_intent": "default"}}
 
     # ── 端口相关目标 ─────────────────────────────────────────────────────────
-    if "端口" in text_lower or "port" in text_lower or "netstat" in text_lower or "ss " in text_lower:
+    # 如果同时包含诊断/排查类关键词，优先走诊断分支（不在此处拦截）
+    _is_diagnostic_context = any(kw in text_lower for kw in ["排查", "诊断", "diagnose", "diagnostic", "无法访问", "不能访问", "连不上", "不通"])
+    if ("端口" in text_lower or "port" in text_lower or "netstat" in text_lower or "ss " in text_lower) and not _is_diagnostic_context:
         # 提取具体端口号（如"查看9600端口"、"80端口"、"port 443"）
         port_match = re.search(r'(\d{2,5})\s*端口|端口\s*(\d{2,5})|port\s*(\d{2,5})', text_lower)
         if port_match:
@@ -470,10 +478,19 @@ def _extract_single_intent(text: str) -> Dict[str, Any]:
         if "日志" in text_lower:
             return {"intent": "docker_logs", "parameters": {"sub_intent": "default"}}
 
+    # ── 配置修改 ─────────────────────────────────────────────────────────────
+    if any(kw in text_lower for kw in ["修改", "改", "换"]) and any(kw in text_lower for kw in ["配置", "端口", "设置", "监听"]):
+        service_match = re.search(r'(nginx|apache2?|httpd|mysql|redis|ssh|tomcat|jenkins)', text_lower)
+        service = service_match.group(1) if service_match else ""
+        port_match = re.search(r'(\d{2,5})', text)
+        port = port_match.group(1) if port_match else ""
+        return {"intent": "modify_service_config", "parameters": {"service": service, "port": port, "sub_intent": "port"}}
+
     # ── 诊断 ──────────────────────────────────────────────────────────────────
-    if "排查" in text_lower or "诊断" in text_lower or "diagnose" in text_lower or "diagnostic" in text_lower or "无法访问" in text_lower or "不能访问" in text_lower:
+    # 注意：必须包含明确的诊断/排查/无法访问关键词，单纯提到"端口"不会进入此处
+    if any(kw in text_lower for kw in ["排查", "诊断", "diagnose", "diagnostic", "无法访问", "不能访问", "连不上", "不通"]):
         params = {"description": text}
-        if "80" in text_lower or "端口" in text_lower:
+        if "80" in text_lower or "8080" in text_lower or "443" in text_lower or "9600" in text_lower:
             params["sub_intent"] = "port"
         elif "进程" in text_lower:
             params["sub_intent"] = "process"
@@ -556,13 +573,13 @@ def identify_intent(state: AgentState) -> Dict[str, Any]:
             "current_task_index": current_idx,
             "task_status": state.get("task_status", "in_progress"),
             "conversation_history": history,
-            "intent": state.get("intent", current_task.get("intent", "other")),
-            "parameters": state.get("parameters", current_task.get("parameters", {})),
+            "intent": current_task.get("intent", "other"),
+            "parameters": current_task.get("parameters", {}),
             "task_execution_order": state.get("task_execution_order", _compute_execution_order(task_sequence)),
             "execution_log": state.get("execution_log", []),
             "rollback_stack": state.get("rollback_stack", []),
             "branch_results": state.get("branch_results", {}),
-            "last_intent": state.get("last_intent", current_task.get("intent", "")),
+            "last_intent": current_task.get("intent", ""),
             "consistency_issues": state.get("consistency_issues", []),
         }
 
@@ -578,7 +595,8 @@ def identify_intent(state: AgentState) -> Dict[str, Any]:
         if llm_tasks:
             validation = task_decomposer.validate_plan(llm_tasks)
             if validation["valid"]:
-                task_sequence = llm_tasks
+                # 重要：必须通过_normalize_tasks规范化，command应由generate_command生成
+                task_sequence = task_decomposer._normalize_tasks(llm_tasks, user_input)
             else:
                 # LLM 计划无效，退化到规则解析
                 intents = _parse_intents(user_input)
@@ -721,7 +739,9 @@ def generate_command(state: AgentState) -> Dict[str, Any]:
     os_type = env.get("os_type", "linux")
     branch_results = state.get("branch_results", {})
 
-    if _is_confirmation_resume(state):
+    # 对于多步骤任务，即使是从确认恢复，也需要为当前任务生成新命令
+    # 旧command只用于单步骤确认场景
+    if _is_confirmation_resume(state) and len(task_sequence) == 1:
         existing_risk = state.get("risk_assessment", {})
         return {
             "command": state.get("command", ""),
@@ -868,10 +888,18 @@ def generate_command(state: AgentState) -> Dict[str, Any]:
             command += f" && chown {_safe_arg(username, os_type)}:{_safe_arg(username, os_type)} {_safe_arg(path, os_type)}"
     elif intent == "diagnostic":
         desc = params.get("description", "")
-        if "80" in desc or "端口" in desc:
+        if "80" in desc or "8080" in desc or "443" in desc:
             command = "ss -tuln | grep :80 && systemctl status nginx 2>/dev/null || systemctl status apache2 2>/dev/null || echo 'No web server found'"
         else:
             command = "echo 'Diagnostic mode: please specify the issue'"
+    elif intent == "modify_service_config":
+        service = params.get("service", "")
+        port = params.get("port", "")
+        if service and port:
+            # 生成预览命令：先查看当前配置，不直接修改（由 LLM 编排后续步骤执行实际修改）
+            command = f"grep -rn 'listen' /etc/{service}/ 2>/dev/null | head -5 || grep -rn 'listen' /etc/{service}.conf 2>/dev/null | head -5 || echo '未找到 {service} 配置文件中的 listen 配置'"
+        else:
+            command = f"echo '请指定服务名和目标端口以进行配置修改'"
     elif intent == "other":
         fallback_command = (state.get("user_input", "") or params.get("fallback_text", "")).strip()
         if ALLOW_RAW_SHELL_FALLBACK and SecurityTools.is_safe_raw_shell_fallback(fallback_command):
@@ -1008,6 +1036,37 @@ def execute_command(state: AgentState) -> Dict[str, Any]:
                 result_text += f"\n重试 ({retries}/{max_retries - 1})...\n"
                 time.sleep(1)
     task_status = "completed" if success else "failed"
+
+    # ── 执行后验证框架（不能只看 exit_code）───────────────────────────────────
+    # 无论命令成功还是失败，都运行验证，根据验证结果和exit_code共同决定最终状态
+    if task_sequence and idx < len(task_sequence):
+        task = task_sequence[idx]
+        intent = task.get("intent", "other")
+        params = task.get("parameters", {})
+        if ExecutionVerifier.has_verification(intent):
+            try:
+                verify_res = ExecutionVerifier.verify(
+                    intent, params, SystemTools._run_command, os_type
+                )
+                if verify_res:
+                    result_text += f"\n[验证] {verify_res.message}\n"
+                    contract = ExecutionVerifier.REGISTRY.get(intent, {})
+                    expect_nonzero = contract.get("expect") == "nonzero"
+
+                    if not success and expect_nonzero and verify_res.passed:
+                        task_status = "skipped"
+                        success = True
+                        result_text += f"目标状态已达（用户不存在），标记为跳过。\n"
+                    elif not verify_res.passed:
+                        # 其他验证不通过的情况
+                        if contract.get("on_mismatch") == "fail":
+                            task_status = "failed"
+                            result_text += f"验证未通过，该操作被标记为失败。\n"
+                        else:
+                            result_text += f"验证未通过（仅警告），继续后续流程。\n"
+                    # 如果 verify_res.passed == True，说明验证通过，无需修改状态
+            except Exception as e:
+                result_text += f"\n[验证异常] {str(e)}\n"
 
     post_validation = task.get("post_validation")
     if success and post_validation:
@@ -1368,7 +1427,8 @@ def handle_confirmation(state: AgentState) -> Dict[str, Any]:
     if user_confirmed:
         return {
             "risk_assessment": {**state.get("risk_assessment", {}), "requires_confirmation": False},
-            "explanation": confirmation_explanation
+            "explanation": confirmation_explanation,
+            "confirmation_processed": True,
         }
     else:
         result_text = "操作已取消（用户拒绝执行高风险操作）"
@@ -1382,12 +1442,14 @@ def handle_confirmation(state: AgentState) -> Dict[str, Any]:
                 "current_task_index": next_idx,
                 "task_status": "in_progress" if next_idx < len(updated) else "completed",
                 "risk_assessment": {**state.get("risk_assessment", {}), "requires_confirmation": False},
-                "explanation": confirmation_explanation
+                "explanation": confirmation_explanation,
+                "confirmation_processed": True,
             }
         return {
             "execution_result": result_text,
             "risk_assessment": {**state.get("risk_assessment", {}), "requires_confirmation": False},
-            "explanation": confirmation_explanation
+            "explanation": confirmation_explanation,
+            "confirmation_processed": True,
         }
 
 

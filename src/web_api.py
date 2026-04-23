@@ -1155,6 +1155,7 @@ async def confirm_risk(request: ConfirmRequest):
             "parameters": saved.get("parameters", task_sequence[0].get("parameters", {}) if task_sequence else {}),
             "last_intent": saved.get("last_intent", ""),
             "consistency_issues": saved.get("consistency_issues", []),
+            "confirmation_processed": False,
         }
 
         result = workflow.invoke(state)

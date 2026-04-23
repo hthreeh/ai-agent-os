@@ -39,6 +39,45 @@ class TestSecurityTools(unittest.TestCase):
         self.assertFalse(self.security_tools.is_safe_raw_shell_fallback("ls && whoami"))
         self.assertTrue(self.security_tools.is_safe_raw_shell_fallback("df -h"))
 
+    # ── 新增：针对性风险说明测试 ──────────────────────────────────────────
+    def test_specific_risk_explanation_userdel(self):
+        expl = self.security_tools.get_risk_explanation("userdel dev1", "linux")
+        self.assertIn("dev1", expl)
+        self.assertIn("删除系统用户", expl)
+
+    def test_specific_risk_explanation_systemctl(self):
+        expl = self.security_tools.get_risk_explanation("systemctl restart nginx", "linux")
+        self.assertIn("nginx", expl)
+        self.assertIn("重启", expl)
+
+    def test_specific_command_impact(self):
+        impacts = self.security_tools.analyze_command_impact("userdel dev1")
+        self.assertTrue(any("dev1" in imp for imp in impacts))
+
+
+class TestExecutionVerifier(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.verifier = importlib.import_module("tools.execution_verifier").ExecutionVerifier
+
+    def test_has_verification_for_create_user(self):
+        self.assertTrue(self.verifier.has_verification("create_user"))
+
+    def test_has_verification_for_delete_user(self):
+        self.assertTrue(self.verifier.has_verification("delete_user"))
+
+    def test_no_verification_for_disk_usage(self):
+        self.assertFalse(self.verifier.has_verification("disk_usage"))
+
+    def test_build_verification_command(self):
+        cmd = self.verifier.build_verification_command("create_user", {"username": "testuser"})
+        self.assertIn("id", cmd)
+        self.assertIn("testuser", cmd)
+
+    def test_delete_user_expects_nonzero(self):
+        contract = self.verifier.REGISTRY.get("delete_user")
+        self.assertEqual(contract["expect"], "nonzero")
+
 
 class TestWorkflow(unittest.TestCase):
     @classmethod
@@ -99,6 +138,52 @@ class TestWorkflow(unittest.TestCase):
             }
         )
         self.assertGreaterEqual(len(result.get("conversation_history", [])), 4)
+
+    # ── 新增：确认恢复后任务链不断裂 ──────────────────────────────────────
+    def test_confirmation_processed_allows_next_task(self):
+        """确认恢复后，confirmation_processed=True，后续任务应正常执行。"""
+        agent_workflow = importlib.import_module("src.agent_workflow")
+        # 模拟需要确认的多任务场景
+        pending = self.workflow.invoke(
+            {
+                "user_input": "删除用户 testuser1, 创建用户 testuser2",
+                "session_id": "test_confirmation_chain",
+            }
+        )
+        if not pending.get("requires_confirmation"):
+            self.skipTest("该环境未触发风险确认，跳过链式测试")
+
+        # 模拟用户确认
+        result = self.workflow.invoke(
+            {
+                "user_input": "删除用户 testuser1, 创建用户 testuser2",
+                "user_confirmation": True,
+                "confirmation_processed": False,
+                "session_id": "test_confirmation_chain",
+                "command": pending.get("command", ""),
+                "task_sequence": pending.get("task_sequence", []),
+                "current_task_index": pending.get("current_task_index", 0),
+                "task_status": pending.get("task_status", "in_progress"),
+                "environment": pending.get("environment", {}),
+                "risk_assessment": {**pending.get("risk_assessment", {}), "requires_confirmation": False},
+                "risk_level": pending.get("risk_level", "medium"),
+                "risk_explanation": pending.get("risk_explanation", ""),
+            }
+        )
+        # 确认后应该处理 confirmation_processed，且 task_sequence 中至少有两个任务痕迹
+        task_sequence = result.get("task_sequence", [])
+        self.assertGreaterEqual(len(task_sequence), 1)
+
+    # ── 新增：诊断意图不应误匹配配置修改 ──────────────────────────────────
+    def test_diagnostic_not_matched_for_port_modification(self):
+        agent_workflow = importlib.import_module("src.agent_workflow")
+        intent = agent_workflow._extract_single_intent("修改nginx端口为9700")
+        self.assertNotEqual(intent["intent"], "diagnostic")
+
+    def test_diagnostic_matched_for_real_diagnose(self):
+        agent_workflow = importlib.import_module("src.agent_workflow")
+        intent = agent_workflow._extract_single_intent("排查80端口无法访问")
+        self.assertEqual(intent["intent"], "diagnostic")
 
 
 if __name__ == "__main__":

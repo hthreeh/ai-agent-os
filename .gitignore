@@ -17,3 +17,13 @@ tmp_*
 
 # OS
 .DS_Store
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyc
+.pytest_cache/
+
+# Sessions (debug logs)
+sessions/session_*
+sessions/ses_*
