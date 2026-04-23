@@ -268,7 +268,9 @@ def _load_session(session_id: str) -> Dict[str, Any]:
 
 
 def _save_session(session_id: str, state: Dict[str, Any]):
+    """原子写入：先写临时文件，再 os.replace 重命名，避免并发写入损坏 JSON"""
     path = os.path.join(SESSION_DIR, f"{session_id}.json")
+    tmp_path = path + ".tmp"
     try:
         serializable = {}
         for k, v in state.items():
@@ -276,10 +278,16 @@ def _save_session(session_id: str, state: Dict[str, Any]):
                 serializable[k] = v[-MAX_SESSION_HISTORY:]
             else:
                 serializable[k] = v
-        with open(path, "w", encoding="utf-8") as f:
+        with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(serializable, f, ensure_ascii=False, indent=2, default=str)
+        os.replace(tmp_path, path)  # 原子替换
     except Exception:
-        pass
+        # 清理残留临时文件
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
 
 
 def _validate_and_fix_state(state: Dict[str, Any]) -> Dict[str, Any]:
@@ -293,14 +301,6 @@ def _is_confirmation_resume(state: Dict[str, Any]) -> bool:
         and bool(state.get("command"))
     )
 
-
-def _is_complex_input(text: str) -> bool:
-    text_lower = text.lower()
-    keyword_count = sum(1 for kw in COMPLEX_KEYWORDS if kw in text_lower)
-    separators = r"(?:然后|并且|接着|最后|，|,|再|后)"
-    parts = re.split(separators, text)
-    part_count = len([p for p in parts if p.strip()])
-    return keyword_count >= 2 or part_count >= 2 or "如果" in text_lower or "排查" in text_lower
 
 
 def _parse_intents(user_input: str) -> List[Dict[str, Any]]:
@@ -563,21 +563,29 @@ def identify_intent(state: AgentState) -> Dict[str, Any]:
 
     use_llm = _api_initialized and task_decomposer is not None
 
-    if _is_complex_input(user_input) and use_llm:
-        llm_tasks = task_decomposer.decompose(user_input, os_type)
+    # 优先使用 LLM 进行任务分解（AI 原生路径）
+    # 无论输入简单还是复杂，都先尝试 LLM；失败时退化到关键词规则
+    if use_llm:
+        try:
+            llm_tasks = task_decomposer.decompose(user_input, os_type)
+        except Exception:
+            llm_tasks = []
         if llm_tasks:
             validation = task_decomposer.validate_plan(llm_tasks)
             if validation["valid"]:
                 task_sequence = llm_tasks
             else:
+                # LLM 计划无效，退化到规则解析
                 intents = _parse_intents(user_input)
                 intents = _apply_slot_memory(intents, history)
                 task_sequence = _build_task_sequence(intents)
         else:
+            # LLM 未返回结果，退化到规则解析
             intents = _parse_intents(user_input)
             intents = _apply_slot_memory(intents, history)
             task_sequence = _build_task_sequence(intents)
     else:
+        # 未配置 API Key，使用规则解析
         intents = _parse_intents(user_input)
         intents = _apply_slot_memory(intents, history)
         task_sequence = _build_task_sequence(intents)
@@ -1161,21 +1169,8 @@ def generate_response(state: AgentState) -> Dict[str, Any]:
         messages.append(msg)
     messages.append({"role": "user", "content": prompt})
 
-    try:
-        resp = client.chat.completions.create(
-            model=OPENAI_MODEL,
-            messages=messages,
-            temperature=0.7,
-            max_tokens=800,
-            timeout=30
-        )
-        response_text = resp.choices[0].message.content.strip()
-        # 去除 LLM 生成的思考内容 (<think> ...</think>) 和开头的解释性语句
-        import re
-        response_text = re.sub(r"\（试行[\s\S]*?\好用）", "", response_text, flags=re.DOTALL)
-        response_text = re.sub(r"^[\s\n]*(?:我识别到|我的理解|下面|以下|我来)\S*\s*", "", response_text, flags=re.MULTILINE).strip()
-        response_text = re.sub(r"^[\s\n]*(?:我|我的)\S*\s*", "", response_text, flags=re.MULTILINE).strip()
-    except Exception:
+    if not _api_initialized or client is None:
+        # 未配置 API Key 时，直接使用 explainability 引擎生成回复
         intent = task_sequence[0].get("intent", "other") if task_sequence else "other"
         response_text = explainer.generate_full_explanation(
             intent=intent,
@@ -1183,6 +1178,33 @@ def generate_response(state: AgentState) -> Dict[str, Any]:
             command=state.get("command", ""),
             result=execution_result
         )
+    else:
+        try:
+            resp = client.chat.completions.create(
+                model=OPENAI_MODEL,
+                messages=messages,
+                temperature=0.7,
+                max_tokens=800,
+                timeout=30
+            )
+            response_text = resp.choices[0].message.content.strip()
+            # 剥离 LLM 思考链标签（<think>...</think> 或 <thinking>...</thinking>）
+            response_text = re.sub(r"<think>[\s\S]*?</think>\s*", "", response_text, flags=re.DOTALL)
+            response_text = re.sub(r"<thinking>[\s\S]*?</thinking>\s*", "", response_text, flags=re.DOTALL)
+            # 处理未闭合的思考标签（标签后的所有内容都是思考过程）
+            for tag in ("<think>", "<thinking>"):
+                idx = response_text.find(tag)
+                if idx != -1:
+                    response_text = response_text[:idx]
+            response_text = response_text.strip()
+        except Exception:
+            intent = task_sequence[0].get("intent", "other") if task_sequence else "other"
+            response_text = explainer.generate_full_explanation(
+                intent=intent,
+                status=task_sequence[0].get("status", "completed") if task_sequence else "completed",
+                command=state.get("command", ""),
+                result=execution_result
+            )
 
     new_history = history + [{"role": "assistant", "content": response_text}]
 
@@ -1217,13 +1239,6 @@ def generate_response(state: AgentState) -> Dict[str, Any]:
     }
 
 
-def _clean_response_text(text: str) -> str:
-    """去除 LLM 生成的思考内容和解释性语句"""
-    import re
-    text = re.sub(r"\（试行[\s\S]*?\好用）", "", text, flags=re.DOTALL)
-    text = re.sub(r"^[\s\n]*(?:我识别到|我的理解|下面|以下|我来)\S*\s*", "", text, flags=re.MULTILINE).strip()
-    text = re.sub(r"^[\s\n]*(?:我|我的)\S*\s*", "", text, flags=re.MULTILINE).strip()
-    return text.strip()
 
 
 def generate_response_streaming(state: AgentState):
@@ -1276,12 +1291,24 @@ def generate_response_streaming(state: AgentState):
                 timeout=30,
                 stream=True
             )
+            buffer = []
             for chunk in stream:
                 delta = chunk.choices[0].delta.content or ""
                 if delta:
-                    # 实时 yield 每个 chunk
-                    yield f"data: {delta}\n\n"
-            # 流结束时发送结束标记
+                    buffer.append(delta)
+            # 流结束后整体剥离 think 标签，再 yield（SSE 最终内容）
+            full_text = "".join(buffer)
+            full_text = re.sub(r"<think>[\s\S]*?</think>\s*", "", full_text, flags=re.DOTALL)
+            full_text = re.sub(r"<thinking>[\s\S]*?</thinking>\s*", "", full_text, flags=re.DOTALL)
+            for tag in ("<think>", "<thinking>"):
+                idx = full_text.find(tag)
+                if idx != -1:
+                    full_text = full_text[:idx]
+            full_text = full_text.strip()
+            # 逐字符流式发送（保留流式体验）
+            import time as _time
+            for ch in full_text:
+                yield f"data: {ch}\n\n"
             yield "data: [DONE]\n\n"
         except Exception as e:
             yield f"data: [ERROR] {str(e)}\n\n"

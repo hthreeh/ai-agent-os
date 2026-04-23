@@ -2,16 +2,18 @@ import os
 import sys
 import time
 import json
+import platform
+import subprocess
+import re as _re
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
 
 from src.agent_workflow import build_workflow, _save_session, _load_session
 from tools.audit_logger import AuditLogger
@@ -39,15 +41,18 @@ app.add_middleware(
 workflow = build_workflow()
 
 
+# ── 数据模型 ─────────────────────────────────────────────────────────────────
+
 class UserRequest(BaseModel):
     input: str
     session_id: Optional[str] = None
 
 
 class ConfirmRequest(BaseModel):
-    user_input: str
-    confirmed: bool
     session_id: str
+    confirmed: bool
+    user_input: Optional[str] = None  # 仅用于生成回复，不用于恢复状态
+    # 以下字段保留兼容性，但服务端会优先使用 session 中保存的状态
     risk_assessment: Optional[Dict] = None
     command: Optional[str] = None
     task_sequence: Optional[list] = None
@@ -75,636 +80,970 @@ class AgentResponse(BaseModel):
     explanation: Optional[str] = None
 
 
+# ── 工具函数 ─────────────────────────────────────────────────────────────────
+
+def _run_safe(args, timeout=5, shell=False):
+    """安全执行子进程命令，失败返回空字符串"""
+    try:
+        r = subprocess.run(
+            args, capture_output=True, text=True,
+            timeout=timeout, check=False, shell=shell
+        )
+        return r.stdout.strip() if r.returncode == 0 else ""
+    except Exception:
+        return ""
+
+
+# ── 实时环境信息 API ──────────────────────────────────────────────────────────
+
+@app.get("/api/env/realtime")
+async def get_realtime_env():
+    """
+    快速获取实时系统信息。
+    直接读取 /proc 文件系统和少量系统命令，不经过 LLM，通常 <1s 完成。
+    """
+    info: Dict[str, Any] = {
+        "hostname": platform.node(),
+        "platform": platform.system(),
+        "architecture": platform.machine(),
+        "os_name": "",
+        "kernel": "",
+        "uptime": "",
+        "load_avg": "",
+        "cpu_percent": None,
+        "memory": {},
+        "disk": [],
+        "network": [],
+        "process_count": 0,
+    }
+
+    if platform.system() == "Linux":
+        # OS 名称
+        try:
+            if os.path.exists("/etc/os-release"):
+                with open("/etc/os-release", encoding="utf-8") as f:
+                    for line in f:
+                        if line.startswith("PRETTY_NAME="):
+                            info["os_name"] = line.split("=", 1)[1].strip().strip('"')
+                            break
+        except Exception:
+            pass
+
+        # 内核版本
+        info["kernel"] = _run_safe(["uname", "-r"])
+
+        # 运行时间
+        uptime_raw = _run_safe(["uptime", "-p"])
+        info["uptime"] = uptime_raw.replace("up ", "", 1) if uptime_raw else ""
+
+        # 负载均值（直接读 /proc/loadavg，极快）
+        try:
+            with open("/proc/loadavg", encoding="utf-8") as f:
+                parts = f.read().split()
+                info["load_avg"] = f"{parts[0]} {parts[1]} {parts[2]}"
+        except Exception:
+            pass
+
+        # 内存（读 /proc/meminfo，比 free 命令快）
+        try:
+            mem: Dict[str, int] = {}
+            with open("/proc/meminfo", encoding="utf-8") as f:
+                for line in f:
+                    parts = line.split()
+                    key = parts[0].rstrip(":")
+                    if key in ("MemTotal", "MemAvailable"):
+                        mem[key] = int(parts[1])  # kB
+            if "MemTotal" in mem and "MemAvailable" in mem:
+                total_kb = mem["MemTotal"]
+                avail_kb = mem["MemAvailable"]
+                used_kb = total_kb - avail_kb
+                total_mb = total_kb // 1024
+                used_mb = used_kb // 1024
+                info["memory"] = {
+                    "total_mb": total_mb,
+                    "used_mb": used_mb,
+                    "percent": round(used_mb / total_mb * 100, 1) if total_mb > 0 else 0,
+                    "total_str": f"{total_mb / 1024:.1f}GB" if total_mb >= 1024 else f"{total_mb}MB",
+                    "used_str": f"{used_mb / 1024:.1f}GB" if used_mb >= 1024 else f"{used_mb}MB",
+                }
+        except Exception:
+            pass
+
+        # CPU 使用率（读两次 /proc/stat，间隔约 0.2s）
+        try:
+            import time as _time
+
+            def _read_cpu():
+                with open("/proc/stat", encoding="utf-8") as f:
+                    line = f.readline()
+                v = [int(x) for x in line.split()[1:8]]
+                return sum(v), v[3]  # total, idle
+
+            t1_total, t1_idle = _read_cpu()
+            _time.sleep(0.2)
+            t2_total, t2_idle = _read_cpu()
+            dt = t2_total - t1_total
+            di = t2_idle - t1_idle
+            info["cpu_percent"] = round((1 - di / dt) * 100, 1) if dt > 0 else 0.0
+        except Exception:
+            pass
+
+        # 磁盘使用情况
+        disk_output = _run_safe(["df", "-h", "--output=target,size,used,avail,pcent"])
+        _SKIP_MOUNTS = ("/proc", "/sys", "/dev", "/run", "/snap", "tmpfs", "udev", "cgroupfs")
+        for line in disk_output.split("\n")[1:]:
+            parts = line.split()
+            if len(parts) < 5:
+                continue
+            mount = parts[0]
+            if any(mount.startswith(p) for p in _SKIP_MOUNTS):
+                continue
+            try:
+                pct = int(parts[4].rstrip("%"))
+            except ValueError:
+                pct = 0
+            info["disk"].append({
+                "mount": mount,
+                "size": parts[1],
+                "used": parts[2],
+                "avail": parts[3],
+                "percent": pct,
+            })
+            if len(info["disk"]) >= 5:
+                break
+
+        # 网络接口（优先用 ip -brief addr，更快）
+        ip_brief = _run_safe(["ip", "-brief", "addr"])
+        if ip_brief:
+            for line in ip_brief.split("\n"):
+                parts = line.split()
+                if len(parts) < 3:
+                    continue
+                iface = parts[0]
+                for addr_part in parts[2:]:
+                    if "/" in addr_part:
+                        ip = addr_part.split("/")[0]
+                        if not ip.startswith("127.") and ":" not in ip:  # 跳过 IPv6 和 lo
+                            info["network"].append({"iface": iface, "ip": ip})
+        else:
+            # 兜底：解析 ip addr 长格式
+            ip_out = _run_safe(["ip", "addr"])
+            matches = _re.findall(r"inet\s+(\d+\.\d+\.\d+\.\d+)/\d+[^\n]*\s+\w+\s+(\w+)$",
+                                  ip_out, _re.MULTILINE)
+            for ip, iface in matches:
+                if not ip.startswith("127."):
+                    info["network"].append({"iface": iface, "ip": ip})
+
+        # 进程数
+        proc_out = _run_safe(["bash", "-c", "ps -e --no-header | wc -l"])
+        if proc_out.strip().isdigit():
+            info["process_count"] = int(proc_out.strip())
+
+    elif platform.system() == "Windows":
+        info["os_name"] = f"Windows {platform.version()}"
+        info["kernel"] = platform.release()
+
+    return info
+
+
+# ── 主页 HTML ─────────────────────────────────────────────────────────────────
+
 @app.get("/", response_class=HTMLResponse)
 async def root():
-    return r"""
-    <!DOCTYPE html>
-    <html lang="zh-CN">
-    <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>操作系统智能代理 | OS Agent</title>
-        <style>
-            :root {
-                --bg-primary: #0a0e1a;
-                --bg-secondary: #111827;
-                --bg-tertiary: #1a2235;
-                --bg-card: #1e293b;
-                --border-color: #2a3550;
-                --text-primary: #e2e8f0;
-                --text-secondary: #94a3b8;
-                --text-muted: #64748b;
-                --accent-blue: #3b82f6;
-                --accent-cyan: #38bdf8;
-                --accent-green: #22c55e;
-                --accent-red: #ef4444;
-                --accent-orange: #f97316;
-                --accent-purple: #a855f7;
-                --gradient-primary: linear-gradient(135deg, #3b82f6 0%, #8b5cf6 100%);
-                --gradient-dark: linear-gradient(180deg, #111827 0%, #0a0e1a 100%);
-                --shadow-sm: 0 1px 2px rgba(0,0,0,0.3);
-                --shadow-md: 0 4px 12px rgba(0,0,0,0.4);
-                --shadow-lg: 0 8px 32px rgba(0,0,0,0.5);
-                --radius-sm: 6px;
-                --radius-md: 10px;
-                --radius-lg: 16px;
-            }
-            * { margin: 0; padding: 0; box-sizing: border-box; }
-            body { font-family: 'Segoe UI', -apple-system, BlinkMacSystemFont, sans-serif; background: var(--gradient-dark); color: var(--text-primary); min-height: 100vh; }
-            
-            .layout { display: flex; height: 100vh; overflow: hidden; }
-            
-            .sidebar {
-                width: 280px; background: var(--bg-secondary); border-right: 1px solid var(--border-color);
-                display: flex; flex-direction: column; flex-shrink: 0;
-            }
-            .sidebar-header { padding: 20px; border-bottom: 1px solid var(--border-color); }
-            .sidebar-header h2 { font-size: 16px; color: var(--accent-cyan); margin-bottom: 4px; }
-            .sidebar-header p { font-size: 12px; color: var(--text-muted); }
-            .new-chat-btn {
-                width: 100%; padding: 10px; margin-top: 12px; background: var(--gradient-primary);
-                border: none; border-radius: var(--radius-md); color: white; font-weight: 600;
-                cursor: pointer; font-size: 14px; transition: opacity 0.2s;
-            }
-            .new-chat-btn:hover { opacity: 0.9; }
-            .session-list { flex: 1; overflow-y: auto; padding: 8px; }
-            .session-item {
-                padding: 10px 12px; border-radius: var(--radius-sm); cursor: pointer;
-                margin-bottom: 4px; transition: background 0.2s; display: flex; justify-content: space-between; align-items: center;
-            }
-            .session-item:hover { background: var(--bg-tertiary); }
-            .session-item.active { background: var(--bg-tertiary); border-left: 3px solid var(--accent-blue); }
-            .session-item .title { font-size: 13px; color: var(--text-primary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; flex: 1; }
-            .session-item .delete-btn {
-                background: none; border: none; color: var(--text-muted); cursor: pointer;
-                padding: 2px 6px; border-radius: 4px; font-size: 12px; opacity: 0; transition: opacity 0.2s;
-            }
-            .session-item:hover .delete-btn { opacity: 1; }
-            .session-item .delete-btn:hover { color: var(--accent-red); background: rgba(239,68,68,0.1); }
-            
-            .main-content { flex: 1; display: flex; flex-direction: column; min-width: 0; }
-            .main-header {
-                padding: 16px 24px; border-bottom: 1px solid var(--border-color);
-                display: flex; justify-content: space-between; align-items: center; background: var(--bg-secondary);
-            }
-            .main-header h1 {
-                font-size: 20px; background: var(--gradient-primary); -webkit-background-clip: text;
-                -webkit-text-fill-color: transparent; background-clip: text;
-            }
-            .main-header .status { font-size: 13px; color: var(--text-muted); display: flex; align-items: center; gap: 6px; }
-            .status-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--accent-green); animation: pulse 2s infinite; }
-            
-            .chat-area { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
-            .messages { flex: 1; overflow-y: auto; padding: 24px; }
-            
-            .msg-wrapper { display: flex; gap: 12px; margin-bottom: 20px; animation: fadeIn 0.3s ease; }
-            .msg-wrapper.user { flex-direction: row-reverse; }
-            .avatar {
-                width: 36px; height: 36px; border-radius: 50%; display: flex; align-items: center;
-                justify-content: center; font-size: 16px; flex-shrink: 0;
-            }
-            .avatar.agent { background: var(--gradient-primary); }
-            .avatar.user { background: var(--bg-tertiary); border: 1px solid var(--border-color); }
-            .msg {
-                max-width: 75%; padding: 14px 18px; border-radius: var(--radius-lg);
-                line-height: 1.6; font-size: 14px; word-wrap: break-word;
-            }
-            .msg-wrapper.user .msg { background: var(--accent-blue); color: white; border-bottom-right-radius: 4px; }
-            .msg-wrapper.agent .msg { background: var(--bg-card); border: 1px solid var(--border-color); border-bottom-left-radius: 4px; }
-            .msg .time { font-size: 11px; color: var(--text-muted); margin-top: 6px; }
-            .msg-wrapper.user .msg .time { color: rgba(255,255,255,0.6); }
-            
-            .msg-risk {
-                background: linear-gradient(135deg, #450a0a 0%, #7f1d1d 100%); border: 1px solid #dc2626;
-                border-radius: var(--radius-md); padding: 16px; margin-bottom: 12px;
-            }
-            .msg-risk .risk-header { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }
-            .msg-risk .risk-badge {
-                background: #dc2626; color: white; padding: 2px 10px; border-radius: 12px;
-                font-size: 12px; font-weight: 600;
-            }
-            .msg-risk .risk-title { color: #fca5a5; font-weight: 600; font-size: 14px; }
-            .msg-risk .risk-detail { font-size: 13px; color: #fecaca; line-height: 1.5; margin-bottom: 12px; }
-            .confirm-btns { display: flex; gap: 10px; margin-top: 12px; }
-            .confirm-btns button {
-                padding: 8px 20px; border: none; border-radius: var(--radius-sm); cursor: pointer;
-                font-weight: 600; font-size: 13px; transition: transform 0.1s;
-            }
-            .confirm-btns button:active { transform: scale(0.96); }
-            .btn-yes { background: var(--accent-green); color: white; }
-            .btn-no { background: var(--accent-red); color: white; }
-            
-            .task-sequence {
-                background: var(--bg-tertiary); border: 1px solid var(--border-color); border-radius: var(--radius-md);
-                padding: 14px; margin: 10px 0;
-            }
-            .task-sequence .task-title { font-size: 13px; color: var(--accent-cyan); font-weight: 600; margin-bottom: 10px; }
-            .task-step { display: flex; align-items: center; gap: 10px; padding: 6px 0; font-size: 13px; }
-            .task-step .step-icon { width: 20px; height: 20px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 10px; flex-shrink: 0; }
-            .task-step .step-icon.done { background: var(--accent-green); color: white; }
-            .task-step .step-icon.running { background: var(--accent-blue); color: white; animation: pulse 1.5s infinite; }
-            .task-step .step-icon.pending { background: var(--text-muted); color: var(--bg-primary); }
-            .task-step .step-text { color: var(--text-secondary); }
-            .task-step .step-text.done { color: var(--accent-green); }
-            .task-step .step-text.running { color: var(--accent-cyan); font-weight: 600; }
-            .task-progress { height: 4px; background: var(--bg-primary); border-radius: 2px; margin-top: 10px; overflow: hidden; }
-            .task-progress .bar { height: 100%; background: var(--gradient-primary); border-radius: 2px; transition: width 0.5s ease; }
-            
-            .thinking-indicator { display: flex; gap: 6px; padding: 8px 0; }
-            .thinking-indicator span {
-                width: 8px; height: 8px; border-radius: 50%; background: var(--accent-cyan);
-                animation: bounce 1.4s infinite;
-            }
-            .thinking-indicator span:nth-child(2) { animation-delay: 0.2s; }
-            .thinking-indicator span:nth-child(3) { animation-delay: 0.4s; }
-            
-            .input-area { padding: 16px 24px; border-top: 1px solid var(--border-color); background: var(--bg-secondary); }
-            .input-row { display: flex; gap: 10px; }
-            .input-row input {
-                flex: 1; padding: 12px 16px; border: 1px solid var(--border-color); border-radius: var(--radius-md);
-                background: var(--bg-primary); color: var(--text-primary); font-size: 14px; outline: none;
-                transition: border-color 0.2s;
-            }
-            .input-row input:focus { border-color: var(--accent-blue); }
-            .input-row button {
-                padding: 12px 24px; border: none; border-radius: var(--radius-md);
-                background: var(--gradient-primary); color: white; cursor: pointer;
-                font-weight: 600; font-size: 14px; transition: opacity 0.2s;
-            }
-            .input-row button:hover { opacity: 0.9; }
-            .input-row button:disabled { opacity: 0.5; cursor: not-allowed; }
-            .examples { margin-top: 10px; display: flex; flex-wrap: wrap; gap: 6px; }
-            .ex-btn {
-                background: var(--bg-tertiary); border: 1px solid var(--border-color); color: var(--text-secondary);
-                padding: 6px 14px; border-radius: 20px; cursor: pointer; font-size: 12px; transition: all 0.2s;
-            }
-            .ex-btn:hover { border-color: var(--accent-cyan); color: var(--accent-cyan); }
-            
-            .env-panel {
-                width: 280px; background: var(--bg-secondary); border-left: 1px solid var(--border-color);
-                padding: 20px; overflow-y: auto; flex-shrink: 0;
-            }
-            .env-panel h3 { font-size: 14px; color: var(--accent-cyan); margin-bottom: 16px; display: flex; align-items: center; gap: 6px; }
-            .env-card {
-                background: var(--bg-card); border: 1px solid var(--border-color); border-radius: var(--radius-md);
-                padding: 14px; margin-bottom: 12px;
-            }
-            .env-card .label { font-size: 12px; color: var(--text-muted); margin-bottom: 4px; }
-            .env-card .value { font-size: 14px; color: var(--text-primary); font-weight: 500; }
-            .env-card .value.highlight { color: var(--accent-green); }
-            .env-stats { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
-            .env-stat { text-align: center; padding: 10px; background: var(--bg-tertiary); border-radius: var(--radius-sm); }
-            .env-stat .stat-val { font-size: 18px; font-weight: 700; color: var(--accent-cyan); }
-            .env-stat .stat-label { font-size: 11px; color: var(--text-muted); margin-top: 2px; }
-            
-            @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
-            @keyframes bounce { 0%,80%,100% { transform: translateY(0); } 40% { transform: translateY(-8px); } }
-            @keyframes fadeIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
-            
-            @media (max-width: 1024px) {
-                .env-panel { display: none; }
-                .sidebar { width: 240px; }
-            }
-            @media (max-width: 768px) {
-                .sidebar { display: none; }
-                .main-header h1 { font-size: 16px; }
-                .msg { max-width: 90%; }
-            }
-            
-            .messages::-webkit-scrollbar, .session-list::-webkit-scrollbar, .env-panel::-webkit-scrollbar { width: 6px; }
-            .messages::-webkit-scrollbar-track, .session-list::-webkit-scrollbar-track, .env-panel::-webkit-scrollbar-track { background: transparent; }
-            .messages::-webkit-scrollbar-thumb, .session-list::-webkit-scrollbar-thumb, .env-panel::-webkit-scrollbar-thumb { background: var(--border-color); border-radius: 3px; }
-            .messages::-webkit-scrollbar-thumb:hover, .session-list::-webkit-scrollbar-thumb:hover, .env-panel::-webkit-scrollbar-thumb:hover { background: var(--text-muted); }
-        </style>
-    </head>
-    <body>
-        <div class="layout">
-            <aside class="sidebar">
-                <div class="sidebar-header">
-                    <h2>会话管理</h2>
-                    <p>管理你的对话历史</p>
-                    <button class="new-chat-btn" onclick="newSession()">+ 新建对话</button>
-                </div>
-                <div class="session-list" id="sessionList"></div>
-            </aside>
-            
-            <main class="main-content">
-                <div class="main-header">
-                    <h1>操作系统智能代理</h1>
-                    <div class="status"><span class="status-dot"></span>在线</div>
-                </div>
-                <div class="chat-area">
-                    <div class="messages" id="messages">
-                        <div class="msg-wrapper agent">
-                            <div class="avatar agent">AI</div>
-                            <div class="msg">
-                                欢迎使用 <b>操作系统智能代理</b>！我可以帮你管理 Linux 服务器。<br><br>
-                                支持功能：
-                                <ul style="margin-left: 18px; margin-top: 6px;">
-                                    <li>系统信息查询</li>
-                                    <li>进程和端口管理</li>
-                                    <li>文件和目录操作</li>
-                                    <li>连续任务自动执行</li>
-                                </ul>
-                                <div class="time">系统</div>
-                            </div>
-                        </div>
-                    </div>
-                    <div class="input-area">
-                        <div class="input-row">
-                            <input type="text" id="inp" placeholder="输入命令，如：查询磁盘使用情况" onkeypress="if(event.key==='Enter')sendMessage()">
-                            <button id="sendBtn" onclick="sendMessage()">发送</button>
-                        </div>
-                        <div class="examples">
-                            <button class="ex-btn" onclick="set('查询磁盘使用情况')">磁盘使用</button>
-                            <button class="ex-btn" onclick="set('查看当前运行的进程')">查看进程</button>
-                            <button class="ex-btn" onclick="set('查看开放的端口')">查看端口</button>
-                            <button class="ex-btn" onclick="set('搜索 /etc 目录下的所有 .conf 文件')">搜索配置</button>
-                            <button class="ex-btn" onclick="set('查看系统信息')">系统信息</button>
-                            <button class="ex-btn" onclick="set('先查看磁盘使用情况，然后查看进程状态')">连续任务</button>
-                            <button class="ex-btn" onclick="set('检查磁盘空间，如果不足就清理日志，然后安装 nginx')">场景一</button>
-                            <button class="ex-btn" onclick="set('创建新用户 dev1，配置 sudo 权限，部署工作目录')">场景二</button>
-                            <button class="ex-btn" onclick="set('排查80端口无法访问的原因')">场景三</button>
-                        </div>
-                    </div>
-                </div>
-            </main>
-            
-            <aside class="env-panel">
-                <h3>环境信息</h3>
-                <div class="env-card">
-                    <div class="label">操作系统</div>
-                    <div class="value highlight" id="env-os">检测中...</div>
-                </div>
-                <div class="env-card">
-                    <div class="label">主机名</div>
-                    <div class="value" id="env-hostname">-</div>
-                </div>
-                <div class="env-card">
-                    <div class="label">内核版本</div>
-                    <div class="value" id="env-kernel">-</div>
-                </div>
-                <div class="env-card">
-                    <div class="label">会话统计</div>
-                    <div class="env-stats">
-                        <div class="env-stat"><div class="stat-val" id="stat-sessions">0</div><div class="stat-label">会话数</div></div>
-                        <div class="env-stat"><div class="stat-val" id="stat-msgs">0</div><div class="stat-label">消息数</div></div>
-                    </div>
-                </div>
-            </aside>
+    return r"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>OS Agent · 智能系统管理</title>
+<meta name="description" content="基于 LangGraph 的 AI 原生操作系统管理助手，支持自然语言交互进行服务器运维">
+<script src="https://cdn.jsdelivr.net/npm/marked@9.1.6/marked.min.js"></script>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/styles/github-dark.min.css">
+<script src="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/highlight.min.js"></script>
+<style>
+:root {
+  --bg-0:#070b14; --bg-1:#0d1117; --bg-2:#161b22; --bg-3:#1c2333; --bg-4:#21262d;
+  --border:#30363d; --border-h:#484f58;
+  --t1:#e6edf3; --t2:#8b949e; --t3:#6e7681;
+  --blue:#58a6ff; --blue-d:#1f6feb;
+  --green:#3fb950; --green-d:#238636;
+  --red:#f85149; --orange:#ffa657; --purple:#bc8cff;
+  --grad: linear-gradient(135deg,#58a6ff 0%,#bc8cff 100%);
+  --shadow:0 8px 32px rgba(0,0,0,.5);
+}
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans SC',sans-serif;background:var(--bg-0);color:var(--t1);height:100vh;overflow:hidden}
+
+/* Layout */
+.layout{display:flex;height:100vh}
+
+/* Sidebar */
+.sidebar{width:256px;background:var(--bg-1);border-right:1px solid var(--border);display:flex;flex-direction:column;flex-shrink:0}
+.sb-top{padding:14px;border-bottom:1px solid var(--border)}
+.app-logo{display:flex;align-items:center;gap:10px;margin-bottom:12px}
+.app-logo .icon{width:32px;height:32px;background:var(--grad);border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:16px;flex-shrink:0}
+.app-logo .ttl{font-size:14px;font-weight:600}
+.app-logo .ver{font-size:11px;color:var(--t3);margin-top:1px}
+.new-btn{width:100%;padding:8px 12px;background:var(--bg-3);border:1px solid var(--border);border-radius:6px;color:var(--t2);font-size:13px;cursor:pointer;display:flex;align-items:center;gap:8px;transition:all .15s;font-family:inherit}
+.new-btn:hover{background:var(--bg-4);border-color:var(--border-h);color:var(--t1)}
+.new-btn .plus{font-size:18px;color:var(--blue);line-height:1}
+.sb-search{padding:8px 12px;border-bottom:1px solid var(--border)}
+.sb-search input{width:100%;padding:6px 10px;background:var(--bg-3);border:1px solid var(--border);border-radius:6px;color:var(--t2);font-size:12px;outline:none;font-family:inherit;transition:border-color .15s}
+.sb-search input:focus{border-color:var(--blue-d);color:var(--t1)}
+.sb-search input::placeholder{color:var(--t3)}
+.sb-label{padding:8px 14px 4px;font-size:10px;color:var(--t3);text-transform:uppercase;letter-spacing:.6px;font-weight:700}
+.ses-list{flex:1;overflow-y:auto;padding:4px 8px 8px}
+.ses-item{padding:8px 10px;border-radius:6px;cursor:pointer;margin-bottom:1px;display:flex;align-items:center;gap:8px;transition:background .12s;position:relative}
+.ses-item:hover{background:var(--bg-3)}
+.ses-item.active{background:var(--bg-3);outline:1px solid var(--border)}
+.ses-item .si{font-size:13px;flex-shrink:0;opacity:.7}
+.ses-item .sb{flex:1;min-width:0}
+.ses-item .st{font-size:13px;color:var(--t1);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;line-height:1.3}
+.ses-item .sm{font-size:11px;color:var(--t3);margin-top:2px}
+.ses-item .sd{opacity:0;background:none;border:none;color:var(--t3);cursor:pointer;padding:2px 4px;border-radius:4px;font-size:15px;transition:all .15s;flex-shrink:0;line-height:1}
+.ses-item:hover .sd{opacity:1}
+.ses-item .sd:hover{color:var(--red);background:rgba(248,81,73,.12)}
+
+/* Main */
+.main{flex:1;display:flex;flex-direction:column;min-width:0;overflow:hidden}
+.mh{padding:11px 20px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;background:var(--bg-1);flex-shrink:0}
+.mh h1{font-size:15px;font-weight:600;background:var(--grad);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}
+.status-dot{width:6px;height:6px;border-radius:50%;background:var(--green);animation:pulse 2s infinite}
+.status-badge{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--t2)}
+
+/* Messages */
+.msgs-wrap{flex:1;overflow-y:auto}
+.msgs{max-width:880px;margin:0 auto;padding:20px}
+.mrow{display:flex;gap:12px;margin-bottom:20px;animation:fadeUp .22s ease}
+.mrow.user{flex-direction:row-reverse}
+.av{width:30px;height:30px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:700;flex-shrink:0;margin-top:3px}
+.av.ai{background:var(--grad);color:#fff}
+.av.usr{background:var(--bg-4);color:var(--t2);border:1px solid var(--border)}
+.mcont{flex:1;min-width:0;max-width:82%}
+.mrow.user .mcont{display:flex;flex-direction:column;align-items:flex-end}
+.bubble{padding:11px 15px;border-radius:12px;line-height:1.65;font-size:14px;word-break:break-word}
+.mrow.user .bubble{background:var(--blue-d);color:#fff;border-radius:12px 4px 12px 12px}
+.mrow.ai .bubble{background:var(--bg-2);border:1px solid var(--border);border-radius:4px 12px 12px 12px;color:var(--t1);width:100%}
+/* markdown inside bubble */
+.bubble h1,.bubble h2,.bubble h3{margin:14px 0 6px;font-weight:600;line-height:1.3}
+.bubble h1{font-size:17px;color:var(--blue)}
+.bubble h2{font-size:15px;border-bottom:1px solid var(--border);padding-bottom:4px}
+.bubble h3{font-size:14px;color:var(--t1)}
+.bubble p{margin:5px 0}
+.bubble ul,.bubble ol{margin:5px 0 5px 20px}
+.bubble li{margin:2px 0;color:var(--t2)}
+.bubble li strong{color:var(--t1)}
+.bubble code{font-family:'Consolas','Monaco',monospace;font-size:12px;background:var(--bg-0);border:1px solid var(--border);border-radius:4px;padding:1px 5px;color:var(--orange)}
+.bubble pre{background:var(--bg-0)!important;border:1px solid var(--border);border-radius:8px;padding:14px;margin:10px 0;overflow-x:auto}
+.bubble pre code{background:none!important;border:none!important;padding:0!important;color:inherit!important;font-size:12px}
+.bubble table{width:100%;border-collapse:collapse;margin:10px 0;font-size:13px}
+.bubble th{background:var(--bg-3);padding:8px 11px;text-align:left;border:1px solid var(--border);font-weight:600;color:var(--blue)}
+.bubble td{padding:6px 11px;border:1px solid var(--border);color:var(--t2)}
+.bubble tr:hover td{background:var(--bg-3)}
+.bubble blockquote{border-left:3px solid var(--blue-d);padding:6px 12px;margin:8px 0;color:var(--t2);background:var(--bg-3);border-radius:0 6px 6px 0}
+.bubble a{color:var(--blue);text-decoration:none}
+.bubble a:hover{text-decoration:underline}
+.bubble strong{color:var(--t1)}
+.bubble em{color:var(--t2)}
+.bubble hr{border:none;border-top:1px solid var(--border);margin:10px 0}
+.mtime{font-size:10px;color:var(--t3);margin-top:3px;padding:0 2px}
+.mrow.user .mtime{text-align:right}
+
+/* Risk card */
+.risk-card{background:linear-gradient(135deg,#1a0a0a,#2d1111);border:1px solid #6e3333;border-radius:10px;padding:15px;margin-bottom:8px}
+.risk-hd{display:flex;align-items:center;gap:10px;margin-bottom:10px}
+.rbadge{background:var(--orange);color:#000;padding:2px 10px;border-radius:12px;font-size:11px;font-weight:800}
+.risk-cmd{font-family:monospace;font-size:13px;color:var(--orange);background:var(--bg-0);padding:8px 12px;border-radius:6px;margin:8px 0;word-break:break-all}
+.risk-desc{font-size:13px;color:#fca5a5;line-height:1.5}
+.confirm-row{display:flex;gap:8px;margin-top:12px}
+.confirm-row button{padding:7px 18px;border:none;border-radius:6px;font-size:13px;font-weight:600;cursor:pointer;transition:all .15s;font-family:inherit}
+.btn-ok{background:var(--green-d);color:#fff}
+.btn-ok:hover{background:var(--green)}
+.btn-no{background:var(--bg-4);color:var(--t2);border:1px solid var(--border)}
+.btn-no:hover{border-color:var(--red);color:var(--red)}
+.confirm-row button:disabled{opacity:.4;cursor:not-allowed}
+
+/* Task sequence */
+.tseq{background:var(--bg-3);border:1px solid var(--border);border-radius:8px;padding:11px 13px;margin-bottom:10px}
+.tseq-ttl{font-size:11px;color:var(--t3);font-weight:700;margin-bottom:9px;text-transform:uppercase;letter-spacing:.5px}
+.tstep{display:flex;align-items:center;gap:9px;padding:4px 0;font-size:13px}
+.ticon{width:20px;height:20px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:10px;font-weight:700;flex-shrink:0}
+.ticon.done{background:var(--green);color:#fff}
+.ticon.run{background:var(--blue-d);color:#fff}
+.ticon.wait{background:var(--bg-4);color:var(--t3);border:1px solid var(--border)}
+.tlbl{color:var(--t2)}
+.tlbl.done{color:var(--green)}
+.tlbl.run{color:var(--blue);font-weight:600}
+
+/* Thinking */
+.thinking{display:flex;gap:4px;align-items:center;padding:6px 0}
+.thinking span{width:6px;height:6px;border-radius:50%;background:var(--blue);animation:bounce 1.4s infinite}
+.thinking span:nth-child(2){animation-delay:.2s}
+.thinking span:nth-child(3){animation-delay:.4s}
+
+/* Status banner */
+.status-banner{display:flex;align-items:center;gap:8px;font-size:12px;padding:4px 12px;border-radius:6px;margin-bottom:8px}
+.status-banner.ok{background:rgba(63,185,80,.1);color:var(--green);border:1px solid rgba(63,185,80,.3)}
+.status-banner.cancel{background:rgba(248,81,73,.1);color:var(--red);border:1px solid rgba(248,81,73,.3)}
+
+/* Input */
+.input-area{border-top:1px solid var(--border);background:var(--bg-1);padding:14px 20px;flex-shrink:0}
+.inp-inner{max-width:880px;margin:0 auto}
+.inp-row{display:flex;gap:8px;align-items:flex-end}
+.inp-row textarea{flex:1;padding:10px 13px;background:var(--bg-2);border:1px solid var(--border);border-radius:8px;color:var(--t1);font-size:14px;outline:none;resize:none;line-height:1.5;min-height:42px;max-height:150px;overflow-y:auto;font-family:inherit;transition:border-color .15s}
+.inp-row textarea:focus{border-color:var(--blue-d)}
+.inp-row textarea::placeholder{color:var(--t3)}
+.send-btn{padding:10px 18px;background:var(--blue-d);color:#fff;border:none;border-radius:8px;font-size:14px;font-weight:600;cursor:pointer;transition:background .15s;height:42px;white-space:nowrap;font-family:inherit}
+.send-btn:hover{background:var(--blue)}
+.send-btn:disabled{opacity:.4;cursor:not-allowed}
+.qbtns{display:flex;flex-wrap:wrap;gap:5px;margin-top:9px}
+.qb{background:var(--bg-3);border:1px solid var(--border);color:var(--t3);padding:3px 11px;border-radius:20px;font-size:12px;cursor:pointer;transition:all .15s;font-family:inherit}
+.qb:hover{border-color:var(--blue-d);color:var(--blue)}
+
+/* Env panel */
+.epanel{width:272px;background:var(--bg-1);border-left:1px solid var(--border);display:flex;flex-direction:column;flex-shrink:0;overflow-y:auto}
+.ep-hd{padding:13px 14px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;flex-shrink:0}
+.ep-hd h3{font-size:12px;font-weight:700;color:var(--t2);text-transform:uppercase;letter-spacing:.6px}
+.ep-refresh{background:none;border:none;color:var(--t3);cursor:pointer;font-size:14px;padding:3px 6px;border-radius:4px;transition:all .15s}
+.ep-refresh:hover{color:var(--blue);background:var(--bg-3)}
+.ep-body{padding:10px;display:flex;flex-direction:column;gap:7px}
+
+/* env cards */
+.ecard{background:var(--bg-2);border:1px solid var(--border);border-radius:8px;padding:11px}
+.ec-ttl{font-size:10px;color:var(--t3);font-weight:700;text-transform:uppercase;letter-spacing:.5px;margin-bottom:8px}
+.ec-os-name{font-size:14px;font-weight:600;color:var(--t1);margin-bottom:6px}
+.drow{display:flex;justify-content:space-between;align-items:center;padding:2px 0}
+.dlbl{font-size:11px;color:var(--t3)}
+.dval{font-size:11px;color:var(--t2);font-family:monospace;max-width:148px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+
+/* resource bars */
+.res-item{margin-bottom:9px}
+.res-item:last-child{margin-bottom:0}
+.res-row{display:flex;justify-content:space-between;margin-bottom:3px}
+.res-name{font-size:12px;color:var(--t2)}
+.res-pct{font-size:12px;font-weight:700}
+.res-bar{height:4px;background:var(--bg-0);border-radius:2px;overflow:hidden}
+.res-fill{height:100%;border-radius:2px;transition:width .6s ease}
+.rf-cpu{background:linear-gradient(90deg,#58a6ff,#bc8cff)}
+.rf-mem{background:linear-gradient(90deg,#3fb950,#2ea043)}
+.rf-dsk{background:linear-gradient(90deg,#ffa657,#f85149)}
+.res-sub{font-size:10px;color:var(--t3);margin-top:2px}
+
+/* disk list */
+.disk-item{margin-bottom:7px}
+.disk-item:last-child{margin-bottom:0}
+.disk-row{display:flex;justify-content:space-between;margin-bottom:3px}
+.disk-mnt{font-size:12px;color:var(--t2);font-family:monospace}
+.disk-pct{font-size:12px;font-weight:700}
+
+/* network */
+.net-item{display:flex;justify-content:space-between;padding:3px 0;border-bottom:1px solid var(--border)}
+.net-item:last-child{border-bottom:none}
+.net-iface{font-size:11px;color:var(--t3);font-family:monospace}
+.net-ip{font-size:12px;color:var(--t1);font-family:monospace}
+
+/* stats grid */
+.eg-grid{display:grid;grid-template-columns:1fr 1fr;gap:6px}
+.eg-cell{background:var(--bg-2);border:1px solid var(--border);border-radius:8px;padding:9px;text-align:center}
+.eg-val{font-size:20px;font-weight:700;color:var(--blue)}
+.eg-lbl{font-size:10px;color:var(--t3);margin-top:2px;text-transform:uppercase;letter-spacing:.4px}
+
+.ep-loading{display:flex;align-items:center;justify-content:center;padding:28px;color:var(--t3);font-size:12px;flex-direction:column;gap:8px}
+
+/* scrollbars */
+::-webkit-scrollbar{width:5px;height:5px}
+::-webkit-scrollbar-track{background:transparent}
+::-webkit-scrollbar-thumb{background:var(--border);border-radius:3px}
+::-webkit-scrollbar-thumb:hover{background:var(--border-h)}
+
+/* animations */
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
+@keyframes bounce{0%,80%,100%{transform:translateY(0)}40%{transform:translateY(-5px)}}
+@keyframes fadeUp{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
+
+/* responsive */
+@media(max-width:1180px){.epanel{display:none}}
+@media(max-width:860px){.sidebar{display:none}}
+</style>
+</head>
+<body>
+<div class="layout">
+
+<!-- ── Sidebar ── -->
+<aside class="sidebar">
+  <div class="sb-top">
+    <div class="app-logo">
+      <div class="icon">⚡</div>
+      <div>
+        <div class="ttl">OS Agent</div>
+        <div class="ver">v2.0 · LangGraph</div>
+      </div>
+    </div>
+    <button class="new-btn" id="newChatBtn" onclick="newSession()">
+      <span class="plus">+</span> 新建对话
+    </button>
+  </div>
+  <div class="sb-search">
+    <input type="text" id="sesSearch" placeholder="搜索对话..." oninput="filterSessions(this.value)">
+  </div>
+  <div class="sb-label">最近对话</div>
+  <div class="ses-list" id="sesList"></div>
+</aside>
+
+<!-- ── Main ── -->
+<main class="main">
+  <div class="mh">
+    <h1 id="mainTitle">操作系统智能助手</h1>
+    <div class="status-badge">
+      <span class="status-dot"></span>
+      <span>在线</span>
+    </div>
+  </div>
+
+  <div class="msgs-wrap" id="msgsWrap">
+    <div class="msgs" id="msgs">
+      <div class="mrow ai" id="welcomeMsg">
+        <div class="av ai">AI</div>
+        <div class="mcont">
+          <div class="bubble">
+            👋 欢迎使用 <strong>OS Agent</strong> — 基于 LangGraph 的 AI 原生系统管理助手。<br><br>
+            我可以帮你完成：
+            <ul style="margin:8px 0 0 18px">
+              <li>系统监控（磁盘、内存、CPU、进程、端口）</li>
+              <li>多步任务自动编排与依赖调度</li>
+              <li>用户管理、服务管理与故障诊断</li>
+              <li>高风险操作自动拦截与人工确认</li>
+            </ul>
+          </div>
+          <div class="mtime">系统消息</div>
         </div>
-        <script>
-        (function() {
-            let sessionId = localStorage.getItem('os_agent_session') || ('session_' + Date.now());
-            let sessions = [];
-            let pendingUserInput = '';
-            let pendingState = null;
-            let messageCount = 0;
+      </div>
+    </div>
+  </div>
 
-            function formatTime(ts) {
-                var d = ts ? new Date(ts * 1000) : new Date();
-                var h = String(d.getHours()).padStart(2, '0');
-                var m = String(d.getMinutes()).padStart(2, '0');
-                return h + ':' + m;
-            }
+  <div class="input-area">
+    <div class="inp-inner">
+      <div class="inp-row">
+        <textarea id="inp" placeholder="输入自然语言指令，例如：检查磁盘使用情况" rows="1"
+          oninput="autoResize(this)" onkeydown="handleKey(event)"></textarea>
+        <button class="send-btn" id="sendBtn" onclick="sendMsg()">发送</button>
+      </div>
+      <div class="qbtns">
+        <button class="qb" onclick="qi('查询磁盘使用情况')">磁盘使用</button>
+        <button class="qb" onclick="qi('查看内存使用情况')">内存状态</button>
+        <button class="qb" onclick="qi('查看当前运行的进程')">进程列表</button>
+        <button class="qb" onclick="qi('查看开放的网络端口')">端口监听</button>
+        <button class="qb" onclick="qi('查看系统和内核信息')">系统信息</button>
+        <button class="qb" onclick="qi('先查看磁盘，再查看进程，最后看端口')">多步任务</button>
+        <button class="qb" onclick="qi('排查80端口无法访问的原因')">故障诊断</button>
+        <button class="qb" onclick="qi('创建用户 dev1 并配置 sudo 权限')">用户部署</button>
+      </div>
+    </div>
+  </div>
+</main>
 
-            function updateStats() {
-                document.getElementById('stat-sessions').textContent = sessions.length;
-                document.getElementById('stat-msgs').textContent = messageCount;
-            }
+<!-- ── Env Panel ── -->
+<aside class="epanel" id="epanel">
+  <div class="ep-hd">
+    <h3>系统状态</h3>
+    <button class="ep-refresh" onclick="loadEnv()" title="刷新">↻</button>
+  </div>
+  <div class="ep-body" id="epBody">
+    <div class="ep-loading">
+      <div class="thinking"><span></span><span></span><span></span></div>
+      <div>采集中...</div>
+    </div>
+  </div>
+</aside>
 
-            function updateSessions() {
-                var list = document.getElementById('sessionList');
-                list.innerHTML = '';
-                sessions.forEach(function(s) {
-                    var div = document.createElement('div');
-                    div.className = 'session-item' + (s.id === sessionId ? ' active' : '');
-                    var span = document.createElement('span');
-                    span.className = 'title';
-                    var savedTitle = localStorage.getItem('session_title_' + s.id);
-                    span.textContent = savedTitle || s.title || ('对话 ' + s.id.slice(-6));
-                    span.onclick = function() { switchSession(s.id); };
-                    var del = document.createElement('button');
-                    del.className = 'delete-btn';
-                    del.textContent = '×';
-                    del.onclick = function(e) { e.stopPropagation(); deleteSession(s.id); };
-                    div.appendChild(span);
-                    div.appendChild(del);
-                    list.appendChild(div);
-                });
-            }
+</div><!-- .layout -->
 
-            async function loadSessions() {
-                try {
-                    var r = await fetch('/api/sessions');
-                    var d = await r.json();
-                    sessions = (d.sessions || []).map(function(s) {
-                        var title = localStorage.getItem('session_title_' + s.session_id);
-                        return { id: s.session_id, title: title || ('对话 ' + s.session_id.slice(-6)) };
-                    });
-                    if (sessions.length === 0) {
-                        sessions.push({ id: sessionId, title: '新对话' });
-                    }
-                    updateSessions();
-                    updateStats();
-                } catch(e) {
-                    if (sessions.length === 0) {
-                        sessions.push({ id: sessionId, title: '新对话' });
-                        updateSessions();
-                    }
-                }
-            }
+<script>
+(function(){
+'use strict';
 
-            window.newSession = function() {
-                sessionId = 'session_' + Date.now();
-                localStorage.setItem('os_agent_session', sessionId);
-                var title = prompt('输入会话名称（可选）：') || '新对话';
-                localStorage.setItem('session_title_' + sessionId, title);
-                sessions.push({ id: sessionId, title: title });
-                updateSessions();
-                updateStats();
-                document.getElementById('messages').innerHTML = '';
-                addAgentMsg('新对话已创建！我可以帮你管理 Linux 服务器。');
-            };
+// ── 初始化 marked.js ───────────────────────────────────────────────────────
+if(typeof marked!=='undefined'){
+  // 自定义代码高亮 renderer
+  var renderer=new marked.Renderer();
+  renderer.code=function(code,lang){
+    var validLang=lang&&typeof hljs!=='undefined'&&hljs.getLanguage(lang)?lang:null;
+    var highlighted=validLang
+      ?hljs.highlight(code,{language:validLang}).value
+      :(typeof hljs!=='undefined'?hljs.highlightAuto(code).value:escHtml(code));
+    return '<pre><code class="hljs'+(lang?' language-'+lang:'')+'">'+highlighted+'</code></pre>';
+  };
+  marked.use({renderer:renderer,breaks:true,gfm:true});
+}
 
-            async function switchSession(id) {
-                sessionId = id;
-                localStorage.setItem('os_agent_session', id);
-                updateSessions();
-                document.getElementById('messages').innerHTML = '';
-                try {
-                    var r = await fetch('/api/session/' + id + '/history');
-                    var d = await r.json();
-                    var history = d.conversation_history || [];
-                    messageCount = 0;
-                    history.forEach(function(msg) {
-                        addMsgWrapper(msg.role, escHtml(msg.content || ''));
-                    });
-                } catch(e) {
-                    addAgentMsg('会话历史加载失败');
-                }
-            }
-            window.switchSession = switchSession;
+// ── 状态 ──────────────────────────────────────────────────────────────────
+var sesId=localStorage.getItem('osa_sid')||genId();
+var allSes=[];
+var filterQ='';
+var pendingState=null;
+var pendingInput='';
+var busy=false;
 
-            async function deleteSession(id) {
-                try {
-                    await fetch('/api/session/' + id, { method: 'DELETE' });
-                } catch(e) {}
-                localStorage.removeItem('session_title_' + id);
-                sessions = sessions.filter(function(s) { return s.id !== id; });
-                if (id === sessionId && sessions.length > 0) {
-                    sessionId = sessions[sessions.length - 1].id;
-                    localStorage.setItem('os_agent_session', sessionId);
-                    document.getElementById('messages').innerHTML = '';
-                    try {
-                        var r = await fetch('/api/session/' + sessionId + '/history');
-                        var d = await r.json();
-                        (d.conversation_history || []).forEach(function(msg) {
-                            addMsgWrapper(msg.role, escHtml(msg.content || ''));
-                        });
-                    } catch(e) {}
-                } else if (sessions.length === 0) {
-                    sessionId = 'session_' + Date.now();
-                    localStorage.setItem('os_agent_session', sessionId);
-                }
-                updateSessions();
-                updateStats();
-            }
-            window.deleteSession = deleteSession;
-            
-            window.set = function(t) {
-                document.getElementById('inp').value = t;
-                document.getElementById('inp').focus();
-            };
-            
-            function addMsgWrapper(cls, inner, time) {
-                var wrapper = document.createElement('div');
-                wrapper.className = 'msg-wrapper ' + cls;
-                var avatar = document.createElement('div');
-                avatar.className = 'avatar ' + cls;
-                avatar.textContent = cls === 'user' ? '' : 'AI';
-                var msg = document.createElement('div');
-                msg.className = 'msg';
-                msg.innerHTML = inner + '<div class="time">' + (time || formatTime()) + '<\/div>';
-                wrapper.appendChild(avatar);
-                wrapper.appendChild(msg);
-                var messages = document.getElementById('messages');
-                messages.appendChild(wrapper);
-                messages.scrollTop = messages.scrollHeight;
-                messageCount++;
-                updateStats();
-            }
-            
-            function addAgentMsg(html) {
-                addMsgWrapper('agent', html);
-            }
-            
-            function addThinking() {
-                var id = 'thinking_' + Date.now();
-                var wrapper = document.createElement('div');
-                wrapper.className = 'msg-wrapper agent';
-                wrapper.id = id;
-                var avatar = document.createElement('div');
-                avatar.className = 'avatar agent';
-                avatar.textContent = 'AI';
-                var msg = document.createElement('div');
-                msg.className = 'msg';
-                msg.innerHTML = '<div class="thinking-indicator"><span><\/span><span><\/span><span><\/span><\/div><div class="time">思考中...<\/div>';
-                wrapper.appendChild(avatar);
-                wrapper.appendChild(msg);
-                document.getElementById('messages').appendChild(wrapper);
-                document.getElementById('messages').scrollTop = document.getElementById('messages').scrollHeight;
-                return id;
-            }
-            
-            function removeThinking(id) {
-                var el = document.getElementById(id);
-                if (el) el.remove();
-            }
-            
-            function addTaskSequence(tasks) {
-                var html = '<div class="task-sequence"><div class="task-title">任务序列 (' + tasks.length + ' 步)<\/div>';
-                tasks.forEach(function(t, i) {
-                    var icon = i === 0 ? 'running' : 'pending';
-                    var txt = i === 0 ? 'running' : '';
-                    var label = (t && t.description) ? t.description : ((t && t.intent) ? t.intent : ('任务 ' + (i + 1)));
-                    var extras = '';
-                    if (t && t.branch_type && t.branch_type !== 'sequential') {
-                        var branchLabel = t.branch_type === 'conditional' ? '条件分支' : '并行';
-                        extras += ' <span style="color:var(--accent-orange);font-size:11px;">[' + branchLabel + ']<\/span>';
-                    }
-                    if (t && t.depends_on && t.depends_on.length > 0) {
-                        extras += ' <span style="color:var(--text-muted);font-size:11px;">(依赖: ' + t.depends_on.join(', ') + ')<\/span>';
-                    }
-                    html += '<div class="task-step"><div class="step-icon ' + icon + '">' + (i === 0 ? '⟳' : (i + 1)) + '<\/div><span class="step-text ' + txt + '">' + label + extras + '<\/span><\/div>';
-                });
-                html += '<div class="task-progress"><div class="bar" style="width: ' + (100 / tasks.length) + '%"><\/div><\/div><\/div>';
-                addAgentMsg(html);
-            }
-            
-            function escHtml(s) { var d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
-            function escBr(s) { return escHtml(s).replace(/\n/g, '<' + 'br>'); }
+localStorage.setItem('osa_sid',sesId);
 
-            function fetchWithTimeout(url, options, timeout) {
-                return Promise.race([
-                    fetch(url, options),
-                    new Promise(function(_, reject) {
-                        setTimeout(function() { reject(new Error('请求超时，请检查网络或重试')); }, timeout);
-                    })
-                ]);
-            }
+// ── 工具函数 ──────────────────────────────────────────────────────────────
+function genId(){return 'ses_'+Date.now()+'_'+Math.random().toString(36).slice(2,6)}
 
-            async function sendMessage() {
-                var inp = document.getElementById('inp');
-                var txt = inp.value.trim();
-                if (!txt) return;
-                inp.value = '';
-                document.getElementById('sendBtn').disabled = true;
-                pendingUserInput = txt;
-                addMsgWrapper('user', escHtml(txt));
+function escHtml(s){
+  var d=document.createElement('div');
+  d.textContent=s;
+  return d.innerHTML;
+}
 
-                var thinkId = addThinking();
+function stripThink(text){
+  if(!text)return '';
+  // 移除闭合 think/thinking 标签
+  text=text.replace(/<think>[\s\S]*?<\/think>\s*/gi,'');
+  text=text.replace(/<thinking>[\s\S]*?<\/thinking>\s*/gi,'');
+  // 移除未闭合标签及其后所有内容
+  var i=text.indexOf('<think>');
+  if(i!==-1)text=text.substring(0,i);
+  i=text.indexOf('<thinking>');
+  if(i!==-1)text=text.substring(0,i);
+  return text.trim();
+}
 
-                try {
-                    var r = await fetchWithTimeout('/api/query', {
-                        method: 'POST',
-                        headers: {'Content-Type': 'application/json'},
-                        body: JSON.stringify({input: txt, session_id: sessionId})
-                    }, 120000);
-                    var d = await r.json();
-                    removeThinking(thinkId);
+function renderMd(text){
+  text=stripThink(text);
+  if(!text)return '';
+  if(typeof marked!=='undefined'){
+    try{return marked.parse(text)}catch(e){}
+  }
+  return escHtml(text).replace(/\n/g,'<br>');
+}
 
-                    if (d.requires_confirmation) {
-                        var riskHtml = '<div class="msg-risk">';
-                        riskHtml += '<div class="risk-header"><span class="risk-badge">中风险</span><span class="risk-title">需要您的确认</span></div>';
-                        if (d.risk_assessment) {
-                            riskHtml += '<div class="risk-detail">';
-                            riskHtml += '风险解释: ' + (d.risk_assessment.risk_explanation || '该操作存在一定风险') + '<br>';
-                            if (d.risk_assessment.command_impact) {
-                                riskHtml += '潜在影响: ' + d.risk_assessment.command_impact.join(', ') + '<br>';
-                            }
-                            riskHtml += '</div>';
-                        }
-                        riskHtml += '<div class="confirm-btns"><button class="btn-yes" onclick="confirmRisk(true)">确认执行</button><button class="btn-no" onclick="confirmRisk(false)">取消</button></div>';
-                        riskHtml += '</div>';
-                        addMsgWrapper('agent', riskHtml);
-                        pendingState = d;
-                        if (d.session_id) sessionId = d.session_id;
-                    } else {
-                        var resp = escBr(d.response || d.execution_result || '');
-                        addAgentMsg(resp);
-                        if (d.session_id) sessionId = d.session_id;
-                        if (d.environment) {
-                            var env = d.environment;
-                            var osInfo = env.os_info || {};
-                            document.getElementById('env-os').textContent = env.os_type || '未知';
-                            document.getElementById('env-hostname').textContent = osInfo.name || osInfo.hostname || osInfo.pretty_name || '-';
-                            document.getElementById('env-kernel').textContent = osInfo.release || '-';
-                        }
-                    }
-                } catch (e) {
-                    removeThinking(thinkId);
-                    addAgentMsg('<div style="color:var(--accent-red);">错误: ' + e.message + '</div>');
-                }
-                document.getElementById('sendBtn').disabled = false;
-            }
-            
-            function typeText(html) {
-                var id = 'typed_' + Date.now();
-                var wrapper = document.createElement('div');
-                wrapper.className = 'msg-wrapper agent';
-                wrapper.id = id;
-                var avatar = document.createElement('div');
-                avatar.className = 'avatar agent';
-                avatar.textContent = 'AI';
-                var msg = document.createElement('div');
-                msg.className = 'msg';
-                msg.innerHTML = '<span class="typing-cursor"><\/span><div class="time">' + formatTime() + '<\/div>';
-                wrapper.appendChild(avatar);
-                wrapper.appendChild(msg);
-                document.getElementById('messages').appendChild(wrapper);
-                document.getElementById('messages').scrollTop = document.getElementById('messages').scrollHeight;
-                
-                var plain = html.split('<' + 'br>').join('\n').replace(new RegExp('<[^>]*>', 'g'), '');
-                var idx = 0;
-                var speed = 15;
-                var timer = setInterval(function() {
-                    if (idx >= plain.length) {
-                        clearInterval(timer);
-                        msg.innerHTML = html + '<div class="time">' + formatTime() + '<\/div>';
-                        return;
-                    }
-                    var chunk = plain.slice(0, idx + 3);
-                    idx += 3;
-                    msg.innerHTML = escHtml(chunk).replace(/\n/g, '<' + 'br>') + '<span class="typing-cursor">▌<\/span><div class="time">' + formatTime() + '<\/div>';
-                    document.getElementById('messages').scrollTop = document.getElementById('messages').scrollHeight;
-                }, speed);
-            }
-            
-            async function confirmRisk(ok) {
-                var ps = pendingState || {};
-                if (!ps.risk_assessment && !ps.command) {
-                    addAgentMsg('<div style="color:var(--accent-red);">无可确认的操作，请重新发送请求</div>');
-                    return;
-                }
-                // 禁用按钮 + loading 反馈
-                var btns = document.querySelectorAll('.confirm-btns .btn-yes, .confirm-btns .btn-no');
-                btns.forEach(function(b) { b.disabled = true; b.style.opacity = '0.5'; });
-                var thinkId = addThinking();
-                try {
-                    var r = await fetchWithTimeout('/api/confirm', {
-                        method: 'POST',
-                        headers: {'Content-Type': 'application/json'},
-                        body: JSON.stringify({
-                            user_input: pendingUserInput,
-                            confirmed: ok,
-                            session_id: sessionId,
-                            risk_assessment: ps.risk_assessment,
-                            command: ps.command,
-                            task_sequence: ps.task_sequence,
-                            current_task_index: ps.current_task_index,
-                            task_status: ps.task_status,
-                            environment: ps.environment,
-                            risk_level: ps.risk_level,
-                            risk_explanation: ps.risk_explanation
-                        })
-                    }, 120000);
-                    var d = await r.json();
-                    removeThinking(thinkId);
-                    var statusMsg = ok ? '<div style="color:var(--accent-green);font-weight:600;">已确认执行<\/div>' : '<div style="color:var(--accent-red);font-weight:600;">已取消操作<\/div>';
-                    if (d.explanation) {
-                        statusMsg += '<div style="background:var(--bg-tertiary);border:1px solid var(--accent-purple);border-radius:var(--radius-md);padding:12px;margin-top:8px;font-size:13px;color:var(--accent-purple);">' + escHtml(d.explanation) + '<\/div>';
-                    }
-                    var resp = escBr(d.response || d.execution_result || '');
-                    addAgentMsg(statusMsg + resp);
-                    if (d.session_id) sessionId = d.session_id;
-                    if (d.environment) {
-                        var env = d.environment;
-                        var osInfo = env.os_info || {};
-                        document.getElementById('env-os').textContent = env.os_type || '未知';
-                        document.getElementById('env-hostname').textContent = osInfo.name || osInfo.hostname || osInfo.pretty_name || '-';
-                        document.getElementById('env-kernel').textContent = osInfo.release || '-';
-                    }
-                } catch (e) {
-                    removeThinking(thinkId);
-                    addAgentMsg('<div style="color:var(--accent-red);">错误: ' + e.message + '</div>');
-                    btns.forEach(function(b) { b.disabled = false; b.style.opacity = '1'; });
-                }
-                // 确认操作完成后，按钮永久禁用，防止重复点击
-                btns.forEach(function(b) { b.disabled = true; b.style.opacity = '0.3'; b.style.cursor = 'not-allowed'; });
-            }
-            
-            updateSessions();
-            updateStats();
-            window.sendMessage = sendMessage;
-            window.confirmRisk = confirmRisk;
-            loadSessions();
-        })();
-        </script>
-    </body>
-    </html>
-    """
+function fmtTime(ts){
+  var d=ts?new Date(ts*1000):new Date();
+  return String(d.getHours()).padStart(2,'0')+':'+String(d.getMinutes()).padStart(2,'0');
+}
 
+function fmtRel(ts){
+  if(!ts)return '';
+  var s=Date.now()/1000-ts;
+  if(s<60)return '刚刚';
+  if(s<3600)return Math.floor(s/60)+' 分钟前';
+  if(s<86400)return Math.floor(s/3600)+' 小时前';
+  return Math.floor(s/86400)+' 天前';
+}
+
+// ── 会话本地存储 ──────────────────────────────────────────────────────────
+function saveSes(id,data){
+  try{
+    var k='osa_'+id;
+    var ex=getSes(id)||{};
+    localStorage.setItem(k,JSON.stringify(Object.assign({},ex,data)));
+  }catch(e){}
+}
+function getSes(id){
+  try{var r=localStorage.getItem('osa_'+id);return r?JSON.parse(r):null}catch(e){return null}
+}
+function delSesLocal(id){try{localStorage.removeItem('osa_'+id)}catch(e){}}
+function getSesTitle(id){var s=getSes(id);return(s&&s.title)?s.title:'新对话'}
+
+// ── 加载会话列表 ──────────────────────────────────────────────────────────
+async function loadSessions(){
+  try{
+    var r=await fetch('/api/sessions');
+    var d=await r.json();
+    var svr=(d.sessions||[]).map(function(s){return{id:s.session_id,ts:s.last_activity||0}});
+    var map={};svr.forEach(function(s){map[s.id]=s});
+
+    // 合并本地
+    Object.keys(localStorage).filter(function(k){return k.startsWith('osa_ses_')||k.startsWith('osa_')&&k!=='osa_sid'}).forEach(function(k){
+      var id=k.replace(/^osa_/,'');
+      if(id&&!map[id]){var s=getSes(id);if(s)map[id]={id:id,ts:s.lastAt||0}}
+    });
+
+    allSes=Object.values(map).sort(function(a,b){return b.ts-a.ts});
+    if(!allSes.find(function(s){return s.id===sesId})){
+      allSes.unshift({id:sesId,ts:Date.now()/1000});
+    }
+  }catch(e){
+    if(!allSes.length)allSes=[{id:sesId,ts:Date.now()/1000}];
+  }
+  renderSessions();
+}
+
+function renderSessions(){
+  var list=document.getElementById('sesList');
+  list.innerHTML='';
+  var items=filterQ?allSes.filter(function(s){return getSesTitle(s.id).toLowerCase().includes(filterQ.toLowerCase())}):allSes;
+  items.forEach(function(s){
+    var title=getSesTitle(s.id);
+    var active=s.id===sesId;
+    var el=document.createElement('div');
+    el.className='ses-item'+(active?' active':'');
+    el.innerHTML='<span class="si">💬</span>'
+      +'<div class="sb">'
+        +'<div class="st">'+escHtml(title)+'</div>'
+        +'<div class="sm">'+fmtRel(s.ts)+'</div>'
+      +'</div>'
+      +'<button class="sd" title="删除">×</button>';
+    el.querySelector('.sb').onclick=function(){switchSes(s.id)};
+    el.querySelector('.sd').onclick=function(e){e.stopPropagation();deleteSes(s.id)};
+    list.appendChild(el);
+  });
+  // 更新标题
+  var t=getSesTitle(sesId);
+  document.getElementById('mainTitle').textContent=t==='新对话'?'操作系统智能助手':t;
+}
+
+window.filterSessions=function(q){filterQ=q;renderSessions()};
+
+window.newSession=function(){
+  sesId=genId();
+  localStorage.setItem('osa_sid',sesId);
+  saveSes(sesId,{title:'新对话',lastAt:Date.now()/1000});
+  allSes.unshift({id:sesId,ts:Date.now()/1000});
+  clearMsgs();
+  addWelcome();
+  renderSessions();
+  document.getElementById('inp').focus();
+};
+
+function switchSes(id){
+  if(id===sesId)return;
+  sesId=id;
+  localStorage.setItem('osa_sid',id);
+  clearMsgs();
+  renderSessions();
+  loadHistory(id);
+}
+
+async function loadHistory(id){
+  try{
+    var r=await fetch('/api/session/'+id+'/history');
+    var d=await r.json();
+    (d.conversation_history||[]).forEach(function(m){
+      if(m.role==='user')addUserBubble(m.content||'');
+      else if(m.role==='assistant')addAiBubble(m.content||'');
+    });
+  }catch(e){addSysMsg('历史记录加载失败')}
+}
+
+async function deleteSes(id){
+  try{await fetch('/api/session/'+id,{method:'DELETE'})}catch(e){}
+  delSesLocal(id);
+  allSes=allSes.filter(function(s){return s.id!==id});
+  if(id===sesId){
+    sesId=allSes.length?allSes[0].id:genId();
+    if(!allSes.length)allSes=[{id:sesId,ts:Date.now()/1000}];
+    localStorage.setItem('osa_sid',sesId);
+    clearMsgs();addWelcome();
+  }
+  renderSessions();
+}
+
+// ── 消息渲染 ──────────────────────────────────────────────────────────────
+function clearMsgs(){document.getElementById('msgs').innerHTML='';pendingState=null}
+
+function addWelcome(){
+  var msgs=document.getElementById('msgs');
+  var d=document.createElement('div');
+  d.className='mrow ai';
+  d.innerHTML='<div class="av ai">AI</div>'
+    +'<div class="mcont">'
+      +'<div class="bubble">👋 新对话已就绪，请输入您的指令。<br>'
+        +'<span style="color:var(--t3);font-size:13px">提示：复杂任务会被自动分解为多个步骤依次执行。</span>'
+      +'</div>'
+      +'<div class="mtime">'+fmtTime()+'</div>'
+    +'</div>';
+  msgs.appendChild(d);scrollM();
+}
+
+function addUserBubble(text){
+  var msgs=document.getElementById('msgs');
+  var d=document.createElement('div');
+  d.className='mrow user';
+  d.innerHTML='<div class="av usr">你</div>'
+    +'<div class="mcont">'
+      +'<div class="bubble">'+escHtml(text)+'</div>'
+      +'<div class="mtime">'+fmtTime()+'</div>'
+    +'</div>';
+  msgs.appendChild(d);scrollM();
+}
+
+function addAiBubble(text,extraHtml){
+  var msgs=document.getElementById('msgs');
+  var d=document.createElement('div');
+  d.className='mrow ai';
+  var rendered=renderMd(text);
+  d.innerHTML='<div class="av ai">AI</div>'
+    +'<div class="mcont">'
+      +(extraHtml||'')
+      +'<div class="bubble">'+(rendered||'<em style="color:var(--t3)">（无内容）</em>')+'</div>'
+      +'<div class="mtime">'+fmtTime()+'</div>'
+    +'</div>';
+  msgs.appendChild(d);
+  // 代码高亮
+  if(typeof hljs!=='undefined')d.querySelectorAll('pre code').forEach(function(el){hljs.highlightElement(el)});
+  scrollM();
+  return d;
+}
+
+function addSysMsg(text){
+  var msgs=document.getElementById('msgs');
+  var d=document.createElement('div');
+  d.style.cssText='text-align:center;padding:8px;font-size:12px;color:var(--t3)';
+  d.textContent=text;
+  msgs.appendChild(d);scrollM();
+}
+
+function addThinking(){
+  var msgs=document.getElementById('msgs');
+  var d=document.createElement('div');
+  d.id='think_ind';d.className='mrow ai';
+  d.innerHTML='<div class="av ai">AI</div>'
+    +'<div class="mcont"><div class="bubble">'
+      +'<div class="thinking"><span></span><span></span><span></span></div>'
+    +'</div></div>';
+  msgs.appendChild(d);scrollM();
+}
+
+function rmThinking(){var el=document.getElementById('think_ind');if(el)el.remove()}
+
+function buildTaskSeqHtml(tasks){
+  var html='<div class="tseq"><div class="tseq-ttl">任务序列 · '+tasks.length+' 个步骤</div>';
+  tasks.forEach(function(t,i){
+    var lbl=escHtml((t&&t.description)?t.description:(t?t.intent:'步骤'+(i+1)));
+    var ic=i===0?'run':'wait'; var lc=i===0?'run':'';
+    var sym=i===0?'⟳':(i+1);
+    html+='<div class="tstep"><div class="ticon '+ic+'">'+sym+'</div><span class="tlbl '+lc+'">'+lbl+'</span></div>';
+  });
+  return html+'</div>';
+}
+
+function buildRiskHtml(d){
+  var ra=d.risk_assessment||{};
+  var impacts=(ra.command_impact||[]).join('、')||'影响系统配置';
+  return '<div class="risk-card">'
+    +'<div class="risk-hd"><span class="rbadge">⚠ 中等风险</span>'
+    +'<span style="font-size:13px;color:#fca5a5">确认后才能执行</span></div>'
+    +'<div class="risk-cmd">'+escHtml(d.command||'')+'</div>'
+    +'<div class="risk-desc"><strong>风险说明：</strong>'+escHtml(ra.risk_explanation||'该操作存在一定风险')+'<br>'
+    +'<strong>操作影响：</strong>'+escHtml(impacts)+'</div>'
+    +'<div class="confirm-row">'
+      +'<button class="btn-ok" id="btnOk" onclick="doConfirm(true)">✓ 确认执行</button>'
+      +'<button class="btn-no" id="btnNo" onclick="doConfirm(false)">✕ 取消操作</button>'
+    +'</div></div>';
+}
+
+function scrollM(){var w=document.getElementById('msgsWrap');w.scrollTop=w.scrollHeight}
+
+// ── 输入区 ────────────────────────────────────────────────────────────────
+window.autoResize=function(el){el.style.height='auto';el.style.height=Math.min(el.scrollHeight,150)+'px'};
+window.handleKey=function(e){if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();sendMsg()}};
+window.qi=function(t){var i=document.getElementById('inp');i.value=t;i.focus();autoResize(i)};
+
+// ── 发送消息 ──────────────────────────────────────────────────────────────
+async function sendMsg(){
+  var inp=document.getElementById('inp');
+  var txt=inp.value.trim();
+  if(!txt||busy)return;
+
+  busy=true;
+  inp.value='';inp.style.height='auto';
+  document.getElementById('sendBtn').disabled=true;
+  pendingInput=txt;
+
+  // 首条消息作为会话标题
+  var sd=getSes(sesId);
+  if(!sd||!sd.title||sd.title==='新对话'){
+    var newT=txt.length>28?txt.slice(0,28)+'…':txt;
+    saveSes(sesId,{title:newT,lastAt:Date.now()/1000});
+    allSes=allSes.filter(function(s){return s.id!==sesId});
+    allSes.unshift({id:sesId,ts:Date.now()/1000});
+  }else{
+    saveSes(sesId,{lastAt:Date.now()/1000});
+    allSes=allSes.filter(function(s){return s.id!==sesId});
+    allSes.unshift({id:sesId,ts:Date.now()/1000});
+  }
+  renderSessions();
+
+  addUserBubble(txt);
+  addThinking();
+
+  try{
+    var r=await ftTimeout('/api/query',{
+      method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({input:txt,session_id:sesId})
+    },120000);
+    var d=await r.json();
+    rmThinking();
+    if(d.session_id)sesId=d.session_id;
+
+    if(d.requires_confirmation){
+      pendingState=d;
+      var extra=(d.task_sequence&&d.task_sequence.length>1)?buildTaskSeqHtml(d.task_sequence):'';
+      extra+=buildRiskHtml(d);
+      var msgs=document.getElementById('msgs');
+      var el=document.createElement('div');
+      el.className='mrow ai';
+      el.innerHTML='<div class="av ai">AI</div>'
+        +'<div class="mcont">'+extra+'<div class="mtime">'+fmtTime()+'</div></div>';
+      msgs.appendChild(el);scrollM();
+    }else{
+      var extra2=(d.task_sequence&&d.task_sequence.length>1)?buildTaskSeqHtml(d.task_sequence):'';
+      addAiBubble(d.response||d.execution_result||'',extra2);
+    }
+  }catch(e){
+    rmThinking();
+    addAiBubble('❌ 请求失败：'+e.message);
+  }
+
+  busy=false;
+  document.getElementById('sendBtn').disabled=false;
+  inp.focus();
+}
+window.sendMsg=sendMsg;
+
+// ── 风险确认 ──────────────────────────────────────────────────────────────
+window.doConfirm=async function(ok){
+  if(!pendingState)return;
+  document.getElementById('btnOk').disabled=true;
+  document.getElementById('btnNo').disabled=true;
+
+  addThinking();
+  try{
+    var r=await ftTimeout('/api/confirm',{
+      method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({session_id:sesId,confirmed:ok,user_input:pendingInput})
+    },120000);
+    var d=await r.json();
+    rmThinking();
+    var banner=ok
+      ?'<div class="status-banner ok">✓ 已确认执行</div>'
+      :'<div class="status-banner cancel">✕ 操作已取消</div>';
+    addAiBubble(d.response||d.execution_result||(ok?'命令已执行':'已取消'),banner);
+    if(d.session_id)sesId=d.session_id;
+  }catch(e){
+    rmThinking();
+    addAiBubble('❌ 处理确认时出错：'+e.message);
+    var ok2=document.getElementById('btnOk');var no2=document.getElementById('btnNo');
+    if(ok2)ok2.disabled=false;if(no2)no2.disabled=false;
+  }
+  pendingState=null;
+};
+
+function ftTimeout(url,opts,ms){
+  return Promise.race([
+    fetch(url,opts),
+    new Promise(function(_,rej){
+      setTimeout(function(){rej(new Error('请求超时（'+Math.round(ms/1000)+'s）'))},ms)
+    })
+  ]);
+}
+
+// ── 环境信息面板 ──────────────────────────────────────────────────────────
+async function loadEnv(){
+  var body=document.getElementById('epBody');
+  body.innerHTML='<div class="ep-loading"><div class="thinking"><span></span><span></span><span></span></div><div>采集中...</div></div>';
+  try{
+    var r=await fetch('/api/env/realtime');
+    var d=await r.json();
+    renderEnv(d);
+  }catch(e){
+    body.innerHTML='<div class="ep-loading" style="color:var(--red)">采集失败</div>';
+  }
+}
+window.loadEnv=loadEnv;
+
+function pct2Color(pct,red,orange){
+  red=red||85;orange=orange||70;
+  if(pct>=red)return 'var(--red)';
+  if(pct>=orange)return 'var(--orange)';
+  return 'var(--green)';
+}
+
+function renderEnv(d){
+  var body=document.getElementById('epBody');
+  var html='';
+
+  // OS + 基础信息
+  html+='<div class="ecard">';
+  html+='<div class="ec-os-name">'+escHtml(d.os_name||d.platform||'未知系统')+'</div>';
+  if(d.kernel)html+='<div class="drow"><span class="dlbl">内核</span><span class="dval">'+escHtml(d.kernel)+'</span></div>';
+  if(d.hostname)html+='<div class="drow"><span class="dlbl">主机名</span><span class="dval">'+escHtml(d.hostname)+'</span></div>';
+  if(d.architecture)html+='<div class="drow"><span class="dlbl">架构</span><span class="dval">'+escHtml(d.architecture)+'</span></div>';
+  if(d.uptime)html+='<div class="drow"><span class="dlbl">运行时间</span><span class="dval">'+escHtml(d.uptime)+'</span></div>';
+  html+='</div>';
+
+  // CPU + 内存
+  if(d.cpu_percent!==null||d.memory){
+    html+='<div class="ecard"><div class="ec-ttl">资源使用</div>';
+    if(d.cpu_percent!==null&&d.cpu_percent!==undefined){
+      var cc=pct2Color(d.cpu_percent);
+      html+='<div class="res-item">'
+        +'<div class="res-row"><span class="res-name">CPU</span><span class="res-pct" style="color:'+cc+'">'+d.cpu_percent+'%</span></div>'
+        +'<div class="res-bar"><div class="res-fill rf-cpu" style="width:'+Math.min(d.cpu_percent,100)+'%"></div></div>';
+      if(d.load_avg)html+='<div class="res-sub">负载: '+escHtml(d.load_avg)+'</div>';
+      html+='</div>';
+    }
+    if(d.memory&&d.memory.percent!==undefined){
+      var mem=d.memory;var mc=pct2Color(mem.percent,85,70);
+      html+='<div class="res-item">'
+        +'<div class="res-row"><span class="res-name">内存</span><span class="res-pct" style="color:'+mc+'">'+mem.percent+'%</span></div>'
+        +'<div class="res-bar"><div class="res-fill rf-mem" style="width:'+Math.min(mem.percent,100)+'%"></div></div>'
+        +'<div class="res-sub">'+escHtml(mem.used_str||'')+'&nbsp;/&nbsp;'+escHtml(mem.total_str||'')+'</div>'
+        +'</div>';
+    }
+    html+='</div>';
+  }
+
+  // 磁盘
+  if(d.disk&&d.disk.length){
+    html+='<div class="ecard"><div class="ec-ttl">磁盘</div>';
+    d.disk.forEach(function(dk){
+      var dc=pct2Color(dk.percent,90,75);
+      html+='<div class="disk-item">'
+        +'<div class="disk-row"><span class="disk-mnt">'+escHtml(dk.mount)+'</span><span class="disk-pct" style="color:'+dc+'">'+dk.percent+'%</span></div>'
+        +'<div class="res-bar"><div class="res-fill rf-dsk" style="width:'+Math.min(dk.percent,100)+'%"></div></div>'
+        +'<div class="res-sub">'+escHtml(dk.used)+' / '+escHtml(dk.size)+' · 剩余 '+escHtml(dk.avail)+'</div>'
+        +'</div>';
+    });
+    html+='</div>';
+  }
+
+  // 网络
+  if(d.network&&d.network.length){
+    html+='<div class="ecard"><div class="ec-ttl">网络接口</div>';
+    d.network.forEach(function(n){
+      html+='<div class="net-item"><span class="net-iface">'+escHtml(n.iface)+'</span><span class="net-ip">'+escHtml(n.ip)+'</span></div>';
+    });
+    html+='</div>';
+  }
+
+  // 统计
+  html+='<div class="eg-grid">';
+  if(d.process_count)html+='<div class="eg-cell"><div class="eg-val">'+d.process_count+'</div><div class="eg-lbl">进程</div></div>';
+  html+='<div class="eg-cell"><div class="eg-val" id="sesCount">'+allSes.length+'</div><div class="eg-lbl">会话</div></div>';
+  html+='</div>';
+
+  body.innerHTML=html;
+}
+
+// ── 启动 ──────────────────────────────────────────────────────────────────
+(async function init(){
+  var saved=getSes(sesId);
+  if(!saved)saveSes(sesId,{title:'新对话',lastAt:Date.now()/1000});
+  await loadSessions();
+  loadEnv();
+  setInterval(loadEnv,30000);  // 每30秒自动刷新
+  document.getElementById('inp').focus();
+})();
+
+})();
+</script>
+</body>
+</html>"""
+
+
+# ── API 端点 ──────────────────────────────────────────────────────────────────
 
 @app.get("/api/health")
 async def health_check():
@@ -733,6 +1072,9 @@ async def query(request: UserRequest):
 
         result = workflow.invoke(initial_state)
 
+        # 保存 user_input 以便 /api/confirm 恢复状态时使用
+        result["user_input"] = request.input
+
         if result.get("risk_assessment", {}).get("requires_confirmation"):
             _save_session(session_id, result)
             return AgentResponse(
@@ -753,7 +1095,6 @@ async def query(request: UserRequest):
             )
 
         _save_session(session_id, result)
-
         return AgentResponse(
             response=result.get("response", ""),
             execution_result=result.get("execution_result", ""),
@@ -770,29 +1111,35 @@ async def query(request: UserRequest):
 
 @app.post("/api/confirm", response_model=AgentResponse)
 async def confirm_risk(request: ConfirmRequest):
+    """
+    风险确认接口。
+    安全策略：完全从服务端 session 恢复状态，不信任客户端传回的业务状态字段。
+    """
     try:
+        # 完全从服务端恢复状态
         saved = _load_session(request.session_id)
+        if not saved:
+            raise HTTPException(status_code=404, detail="Session not found")
+
         history = saved.get("conversation_history", [])
-        task_sequence = request.task_sequence or saved.get("task_sequence", [])
-        risk_assessment = {
-            **saved.get("risk_assessment", {}),
-            **(request.risk_assessment or {}),
-            "requires_confirmation": False
-        }
+        task_sequence = saved.get("task_sequence", [])
 
         state = {
             "session_id": request.session_id,
-            "user_input": request.user_input,
+            "user_input": saved.get("user_input", request.user_input or ""),
             "user_confirmation": request.confirmed,
             "conversation_history": history,
-            "command": request.command or saved.get("command", ""),
+            "command": saved.get("command", ""),
             "task_sequence": task_sequence,
-            "current_task_index": request.current_task_index if request.current_task_index is not None else saved.get("current_task_index", 0),
-            "task_status": request.task_status or saved.get("task_status", "in_progress"),
-            "environment": request.environment or saved.get("environment", {}),
-            "risk_assessment": risk_assessment,
-            "risk_level": request.risk_level or saved.get("risk_level", risk_assessment.get("risk_level", "medium")),
-            "risk_explanation": request.risk_explanation or saved.get("risk_explanation", risk_assessment.get("risk_explanation", "")),
+            "current_task_index": saved.get("current_task_index", 0),
+            "task_status": saved.get("task_status", "in_progress"),
+            "environment": saved.get("environment", {}),
+            "risk_assessment": {
+                **saved.get("risk_assessment", {}),
+                "requires_confirmation": False,  # 重置标志，允许继续执行
+            },
+            "risk_level": saved.get("risk_level", "medium"),
+            "risk_explanation": saved.get("risk_explanation", ""),
             "task_execution_order": saved.get("task_execution_order", []),
             "execution_log": saved.get("execution_log", []),
             "rollback_stack": saved.get("rollback_stack", []),
@@ -816,6 +1163,8 @@ async def confirm_risk(request: ConfirmRequest):
             execution_log=result.get("execution_log"),
             explanation="",
         )
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -828,7 +1177,6 @@ async def list_sessions():
 @app.delete("/api/session/{session_id}")
 async def delete_session(session_id: str):
     from src.agent_workflow import SESSION_DIR
-    import os
     path = os.path.join(SESSION_DIR, f"{session_id}.json")
     if os.path.exists(path):
         os.remove(path)
@@ -837,11 +1185,10 @@ async def delete_session(session_id: str):
 
 @app.get("/api/session/{session_id}/history")
 async def get_session_history(session_id: str):
-    from src.agent_workflow import _load_session
     saved = _load_session(session_id)
     return {
         "conversation_history": saved.get("conversation_history", []),
-        "environment": saved.get("environment", {})
+        "environment": saved.get("environment", {}),
     }
 
 
@@ -854,6 +1201,8 @@ async def security_events(session_id: Optional[str] = None):
 async def session_audit(session_id: str):
     return {"history": audit_logger.get_session_history(session_id)}
 
+
+# ── WebSocket 支持（保留原有功能）────────────────────────────────────────────
 
 active_connections: Dict[str, WebSocket] = {}
 
@@ -872,22 +1221,14 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                     saved = _load_session(session_id)
                     ws_history = saved.get("conversation_history", [])
                     ws_env = saved.get("environment", {})
-
                     initial_state = {
                         "session_id": session_id,
                         "user_input": user_input,
                         "conversation_history": ws_history,
                         "environment": ws_env,
                     }
-
-                    await websocket.send_json({
-                        "type": "task_started",
-                        "message": "开始执行任务...",
-                        "timestamp": time.time()
-                    })
-
+                    await websocket.send_json({"type": "task_started", "message": "开始执行任务...", "timestamp": time.time()})
                     result = workflow.invoke(initial_state)
-
                     task_sequence = result.get("task_sequence", [])
                     for i, task in enumerate(task_sequence):
                         await websocket.send_json({
@@ -899,7 +1240,6 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                             "result": task.get("result", ""),
                             "timestamp": time.time()
                         })
-
                     await websocket.send_json({
                         "type": "task_completed",
                         "response": result.get("response", ""),
@@ -908,13 +1248,9 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                         "environment": result.get("environment"),
                         "timestamp": time.time()
                     })
-
                     _save_session(session_id, result)
             except json.JSONDecodeError:
-                await websocket.send_json({
-                    "type": "error",
-                    "message": "Invalid JSON format"
-                })
+                await websocket.send_json({"type": "error", "message": "Invalid JSON format"})
     except WebSocketDisconnect:
         if session_id in active_connections:
             del active_connections[session_id]
