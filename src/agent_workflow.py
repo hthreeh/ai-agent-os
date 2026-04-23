@@ -362,6 +362,11 @@ def _extract_single_intent(text: str) -> Dict[str, Any]:
 
     # ── 端口相关目标 ─────────────────────────────────────────────────────────
     if "端口" in text_lower or "port" in text_lower or "netstat" in text_lower or "ss " in text_lower:
+        # 提取具体端口号（如"查看9600端口"、"80端口"、"port 443"）
+        port_match = re.search(r'(\d{2,5})\s*端口|端口\s*(\d{2,5})|port\s*(\d{2,5})', text_lower)
+        if port_match:
+            port_num = port_match.group(1) or port_match.group(2) or port_match.group(3)
+            return {"intent": "port_status", "parameters": {"sub_intent": "specific", "port": port_num}}
         return {"intent": "port_status", "parameters": {"sub_intent": "default"}}
 
     # ── 系统信息 ─────────────────────────────────────────────────────────────
@@ -788,7 +793,12 @@ def generate_command(state: AgentState) -> Dict[str, Any]:
                     return {"command": "", "risk_level": "low", "risk_explanation": f"条件检查失败: {e}"}
 
     # ── Goal-based 命令推导（新的架构）─────────────────────────────────────────
-    command = _derive_best_command(intent, params, os_type)
+    # 端口查询：针对特定端口使用 grep 过滤
+    if intent == "port_status" and params.get("port"):
+        port_num = params["port"]
+        command = f"ss -tuln | head -1 && ss -tuln | grep :{_safe_arg(port_num, os_type)}"
+    else:
+        command = _derive_best_command(intent, params, os_type)
 
     # 特殊处理：需要动态组装命令的 intent ─────────────────────────────────────
     if intent == "search_files":
@@ -1163,7 +1173,16 @@ def generate_response(state: AgentState) -> Dict[str, Any]:
         prompt += f"\n\n上下文变化说明：{context_change}"
 
     messages = [
-        {"role": "system", "content": "你是操作系统智能助手。请用清晰、友好的中文回复用户。"}
+        {"role": "system", "content": (
+            "你是操作系统管理助手，运行在 Web 交互界面中。严格遵守以下回复规则：\n"
+            "1. 重点是结果：直接展示命令执行的关键数据（数值、状态、列表），不要解释命令本身。\n"
+            "2. 绝对禁止输出'相关命令'、'常用命令'、'你还可以'、'如需了解'等教学性段落。\n"
+            "3. 禁止解释表头含义（如'PID是进程ID'）、字段说明、状态说明表格。\n"
+            "4. 提示和建议最多一两句话放末尾，不超过30字。没有必要时不写。\n"
+            "5. 表格数据完整展示全部数据行，禁止用省略号截断。\n"
+            "6. 使用 Markdown 表格排版结构化数据。\n"
+            "7. 回复语言：中文。回复总长度尽量控制在300字以内。"
+        )}
     ]
     for msg in history[-5:]:
         messages.append(msg)
@@ -1275,7 +1294,16 @@ def generate_response_streaming(state: AgentState):
         prompt = f"用户请求: {user_input}\n\n执行环境: {os_type}\n\n{op_expl}\n\n请用中文给出清晰的执行结果说明。"
 
     messages = [
-        {"role": "system", "content": "你是操作系统智能助手。请用清晰、友好的中文回复用户。"}
+        {"role": "system", "content": (
+            "你是操作系统管理助手，运行在 Web 交互界面中。严格遵守以下回复规则：\n"
+            "1. 重点是结果：直接展示命令执行的关键数据（数值、状态、列表），不要解释命令本身。\n"
+            "2. 绝对禁止输出'相关命令'、'常用命令'、'你还可以'、'如需了解'等教学性段落。\n"
+            "3. 禁止解释表头含义（如'PID是进程ID'）、字段说明、状态说明表格。\n"
+            "4. 提示和建议最多一两句话放末尾，不超过30字。没有必要时不写。\n"
+            "5. 表格数据完整展示全部数据行，禁止用省略号截断。\n"
+            "6. 使用 Markdown 表格排版结构化数据。\n"
+            "7. 回复语言：中文。回复总长度尽量控制在300字以内。"
+        )}
     ]
     for msg in history[-5:]:
         messages.append(msg)

@@ -818,18 +818,20 @@ function buildTaskSeqHtml(tasks){
   return html+'</div>';
 }
 
+var _riskCardId=0;
 function buildRiskHtml(d){
+  _riskCardId++;
   var ra=d.risk_assessment||{};
   var impacts=(ra.command_impact||[]).join('、')||'影响系统配置';
-  return '<div class="risk-card">'
+  return '<div class="risk-card" data-rid="'+_riskCardId+'">'
     +'<div class="risk-hd"><span class="rbadge">⚠ 中等风险</span>'
     +'<span style="font-size:13px;color:#fca5a5">确认后才能执行</span></div>'
     +'<div class="risk-cmd">'+escHtml(d.command||'')+'</div>'
     +'<div class="risk-desc"><strong>风险说明：</strong>'+escHtml(ra.risk_explanation||'该操作存在一定风险')+'<br>'
     +'<strong>操作影响：</strong>'+escHtml(impacts)+'</div>'
     +'<div class="confirm-row">'
-      +'<button class="btn-ok" id="btnOk" onclick="doConfirm(true)">✓ 确认执行</button>'
-      +'<button class="btn-no" id="btnNo" onclick="doConfirm(false)">✕ 取消操作</button>'
+      +'<button class="btn-ok" onclick="doConfirm(true)">✓ 确认执行</button>'
+      +'<button class="btn-no" onclick="doConfirm(false)">✕ 取消操作</button>'
     +'</div></div>';
 }
 
@@ -903,14 +905,16 @@ async function sendMsg(){
 window.sendMsg=sendMsg;
 
 // ── 风险确认 ──────────────────────────────────────────────────────────────
+var confirmLocked=false;
 window.doConfirm=async function(ok){
-  if(!pendingState)return;
-  // 立即清空 pendingState 并永久禁用按钮，防止任何二次点击
+  // 三重保护：全局锁 + pendingState 清空 + DOM 禁用
+  if(confirmLocked||!pendingState)return;
+  confirmLocked=true;
   pendingState=null;
-  var okBtn=document.getElementById('btnOk');
-  var noBtn=document.getElementById('btnNo');
-  if(okBtn){okBtn.disabled=true;okBtn.style.opacity='0.3';okBtn.style.cursor='not-allowed';okBtn.onclick=null;}
-  if(noBtn){noBtn.disabled=true;noBtn.style.opacity='0.3';noBtn.style.cursor='not-allowed';noBtn.onclick=null;}
+  // 禁用所有风险确认按钮（包括历史卡片中的）
+  document.querySelectorAll('.btn-ok,.btn-no').forEach(function(b){
+    b.disabled=true;b.style.opacity='0.3';b.style.cursor='not-allowed';b.onclick=null;
+  });
 
   addThinking();
   try{
@@ -928,8 +932,9 @@ window.doConfirm=async function(ok){
   }catch(e){
     rmThinking();
     addAiBubble('❌ 处理确认时出错：'+e.message);
-    // 即使出错也不恢复按钮——操作已被提交，重复提交有风险
   }
+  // 请求完成后解锁，允许后续新的风险卡片被确认
+  confirmLocked=false;
 };
 
 function ftTimeout(url,opts,ms){
